@@ -20,7 +20,7 @@ from sqlalchemy.orm import Session
 
 try:
     from .database import Alert, create_database_tables, get_db
-except ImportError:  # Allows `uvicorn main:app` from SentinelAI-Backend.
+except ImportError:  # También permite iniciar Uvicorn desde SentinelAI-Backend.
     from database import Alert, create_database_tables, get_db
 
 
@@ -132,12 +132,12 @@ async def lifespan(app: FastAPI):
         app.state.database_ready = True
         logger.info("PostgreSQL schema is ready")
     except Exception:
-        # A later request may still succeed if PostgreSQL becomes available.
+        # Las solicitudes posteriores pueden funcionar si PostgreSQL se recupera.
         logger.exception("Database initialization failed; API is running in degraded mode")
 
     yield
 
-    # Keras and SQLAlchemy manage their own process-level cleanup/pools.
+    # Keras y SQLAlchemy administran sus propios recursos durante el cierre.
 
 
 app = FastAPI(
@@ -207,9 +207,8 @@ def _features_dataframe(raw_features: Any, scaler: Any) -> pd.DataFrame:
 
     values = _flatten_numeric_values(raw_features)
 
-    # CIC-IDS2017 CSV files contain 79 columns: 78 numeric inputs plus Label.
-    # Accept a raw 79-value row for compatibility, but never feed Label to a
-    # scaler/model that were both fitted on the 78 model inputs.
+    # CIC-IDS2017 agrega Label a las 78 entradas numéricas. Aceptamos esa fila
+    # completa por compatibilidad, pero la etiqueta no participa de la inferencia.
     if len(values) == expected_count + 1:
         values = values[:-1]
 

@@ -1,17 +1,20 @@
-# Dataset (Pesado) - Bloquea carpetas 'data' en cualquier nivel
+# Los datasets y las capturas se descargan o generan localmente.
 **/data/
 *.csv
 *.pcap
 
-# Entorno virtual
+# Entornos virtuales
 **/env/
 **/venv/
 
-# Python / Jupyter
+# Archivos temporales de Python y Jupyter
 **/__pycache__/
 *.py[cod]
 **/.ipynb_checkpoints/
 
-# Pesos del modelo entrenado
+# Los modelos entrenados se distribuyen por separado debido a su tamaño.
 **/models/*.h5
 **/models/*.keras
+
+# Salidas de ejecución
+*.log

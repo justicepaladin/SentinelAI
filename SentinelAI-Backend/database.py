@@ -38,7 +38,7 @@ class Alert(Base):
     mse_score: Mapped[float] = mapped_column(Float, nullable=False)
 
 
-# pool_pre_ping replaces stale PostgreSQL connections before they reach a request.
+# Verificamos las conexiones del pool antes de reutilizarlas en una solicitud.
 engine = create_engine(
     DATABASE_URL,
     pool_pre_ping=True,
