@@ -2,6 +2,7 @@ import pandas as pd
 import requests
 import time
 import sys
+import random
 
 # Configuración
 API_URL = "http://localhost:8000/ingest"
@@ -35,19 +36,28 @@ def main():
     for index, fila in muestra.iterrows():
         etiqueta_real = fila['Label']
         
-        # Extraemos IPs y puertos si el dataset los tiene, o usamos genéricos
-        src_ip = fila.get('Source IP', '192.168.1.100')
-        dst_ip = fila.get('Destination IP', '10.0.0.1')
-        dst_port = int(fila.get('Destination Port', 80))
+        # 1. Asignamos IPs maliciosas fijas según la firma del ataque
+        if etiqueta_real == "DoS Hulk":
+            ip_simulada = "10.0.50.11"
+        elif etiqueta_real == "DoS GoldenEye":
+            ip_simulada = "10.0.50.12"
+        elif etiqueta_real == "DoS slowloris":
+            ip_simulada = "10.0.50.13"
+        elif etiqueta_real != "BENIGN":
+            ip_simulada = f"10.0.50.{random.randint(20, 99)}" # Otros ataques
+        else:
+            # 2. El tráfico benigno simula venir de distintos usuarios legítimos de tu red local
+            ip_simulada = f"192.168.1.{random.randint(10, 99)}"
 
         # Quitamos la etiqueta para que el modelo no haga trampa
         features = fila.drop('Label').to_dict()
-        
+
+        # 3. Armás el payload usando esa IP dinámica
         payload = {
-            "source_ip": str(src_ip),
-            "destination_ip": str(dst_ip),
-            "destination_port": dst_port,
-            "features": features
+            "source_ip": ip_simulada,
+            "destination_ip": "10.0.0.1",  # O la IP de destino que ya tengas configurada
+            "destination_port": 80,
+            "features": features     # Tu lista de 78 características
         }
 
         try:
