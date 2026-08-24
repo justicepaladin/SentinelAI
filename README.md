@@ -1,175 +1,268 @@
-# SentinelAI
+# SentinelAI - Demo Nivel 1 (Replay del Dataset CIC-IDS2017)
 
-SentinelAI es un sistema de detección de anomalías en tráfico de red desarrollado
-como proyecto de tesis. El modelo aprende el comportamiento del tráfico benigno
-de CIC-IDS2017 y marca como anómalos los flujos cuyo error de reconstrucción
-supera el umbral configurado.
+## Propósito de la demo
 
-El repositorio reúne el ciclo completo: preparación de datos, entrenamiento del
-autoencoder, inferencia mediante una API y envío de flujos desde un nodo Edge.
+Esta rama contiene un escenario reproducible para demostrar el pipeline completo
+de SentinelAI sin depender de una captura de red en vivo. El cliente
+`SentinelAI-Edge/demo_replay.py` toma una muestra controlada de flujos
+CIC-IDS2017 con sus características ya extraídas, la envía flujo por flujo al
+backend y muestra el resultado de la inferencia en tiempo real.
 
-## Arquitectura
+La demostración recorre el circuito end-to-end:
 
 ```text
-CIC-IDS2017 / sensor de red
-            │ CSV
-            ▼
-SentinelAI-Edge/integracion_sensor.py
-            │ POST /ingest
-            ▼
-SentinelAI-Backend (FastAPI)
-            ├── MinMaxScaler + autoencoder
-            └── PostgreSQL (solo anomalías)
+CIC-IDS2017 (Wednesday)
+          │  80 flujos benignos + 20 ataques, mezclados
+          ▼
+     demo_replay.py
+          │  POST /ingest
+          ▼
+       API FastAPI
+          │  MinMaxScaler + Autoencoder
+          ▼
+ cálculo de MSE y comparación con TAU
+          ├──────────────► clasificación en consola
+          └── anomalía ──► tabla alerts en PostgreSQL
 ```
 
-El flujo de inferencia sigue estos pasos:
+El backend normaliza las 78 características esperadas por el modelo, reconstruye
+el flujo con el Autoencoder y calcula el error cuadrático medio (MSE):
 
-1. El cliente Edge lee cada fila de `flujos_capturados.csv`.
-2. La API ordena las 78 características según el scaler entrenado y aplica la
-   misma normalización utilizada durante el entrenamiento.
-3. El autoencoder reconstruye el flujo y la API calcula su error cuadrático medio
-   (MSE).
-4. Si el MSE supera `0.000308`, la anomalía se guarda en la tabla `alerts` de
-   PostgreSQL.
+$$
+\operatorname{MSE}(x, \hat{x}) = \frac{1}{n}\sum_{i=1}^{n}(x_i-\hat{x}_i)^2
+$$
 
-## Estructura del repositorio
+Un flujo se clasifica como anómalo cuando su MSE supera el umbral configurado
+(`TAU = 0.000308`). Las anomalías se guardan en PostgreSQL; los flujos
+clasificados como normales no se persisten.
 
-| Ruta | Contenido |
+## Valor técnico
+
+La Demo Nivel 1 desacopla la validación del modelo de las variables propias de la
+captura en vivo, como el tráfico disponible, la interfaz de red, los permisos del
+sensor o el tiempo necesario para observar un ataque. Al utilizar una selección
+repetible (`random_state=42`), permite comparar la etiqueta real de los mismos 80
+flujos benignos y 20 ataques con la decisión del Autoencoder. El orden de envío
+se mezcla de nuevo en cada ejecución, pero la composición de la muestra se
+mantiene.
+
+Cada línea de la consola presenta la etiqueta real, la clasificación producida
+por SentinelAI y el MSE. Esa comparación hace visibles los verdaderos positivos,
+falsos positivos, verdaderos negativos y falsos negativos que sustentan la
+validación empírica de las métricas de *Precision* y *Recall*:
+
+$$
+\operatorname{Precision} = \frac{TP}{TP+FP}
+\qquad
+\operatorname{Recall} = \frac{TP}{TP+FN}
+$$
+
+`demo_replay.py` no calcula automáticamente el resumen agregado de estas
+métricas; muestra la evidencia flujo por flujo para contrastar el comportamiento
+del modelo con las métricas obtenidas durante su evaluación.
+
+## Componentes involucrados
+
+| Componente | Función en la demo |
 | --- | --- |
-| `SentinelAI-Model/` | Notebook de exploración, limpieza, entrenamiento y validación. |
-| `SentinelAI-Model/models/` | Scaler versionado y modelo entrenado local. |
-| `SentinelAI-Backend/` | API FastAPI, carga de artefactos y persistencia de alertas. |
-| `SentinelAI-Edge/` | Cliente que reproduce un CSV como una secuencia de flujos. |
-| `start_demo.sh` | Orquestador de PostgreSQL, backend y cliente Edge. |
+| `SentinelAI-Edge/demo_replay.py` | Selecciona 80 flujos benignos y 20 ataques, los mezcla y los inyecta secuencialmente. |
+| `SentinelAI-Backend/main.py` | Expone `POST /ingest`, ejecuta la inferencia y devuelve el MSE y la clasificación. |
+| `SentinelAI-Backend/database.py` | Crea la tabla `alerts` y administra la persistencia mediante SQLAlchemy. |
+| `SentinelAI-Model/models/sentinel_scaler.save` | Aplica la misma normalización utilizada durante el entrenamiento. |
+| `SentinelAI-Model/models/sentinel_model.h5` | Autoencoder entrenado para reconstruir tráfico benigno. |
+| `sentinel-postgres` | Contenedor PostgreSQL que almacena las alertas detectadas. |
 
-Los datasets, capturas, modelos Keras y archivos de log se mantienen fuera de Git
-por su tamaño o porque se generan durante la ejecución.
+## Requisitos previos
 
-## Requisitos
+- Linux con Docker en ejecución.
+- Python 3.10 o superior y soporte para entornos virtuales (`venv`).
+- Rama `demo50` activa.
+- Dataset de los miércoles de CIC-IDS2017 en
+  `SentinelAI-Model/data/Wednesday-workingHours.pcap_ISCX.csv`.
+- Modelo entrenado en `SentinelAI-Model/models/sentinel_model.h5`.
+- Scaler en `SentinelAI-Model/models/sentinel_scaler.save`.
+- Puerto `5432` disponible para PostgreSQL y puerto `8000` disponible para la
+  API.
 
-- Python 3.10 o superior.
-- Docker, para iniciar PostgreSQL con el orquestador.
-- Los archivos `sentinel_scaler.save` y `sentinel_model.h5` en
-  `SentinelAI-Model/models/`.
-- Un CSV compatible con CIC-IDS2017 en
-  `SentinelAI-Edge/flujos_capturados.csv`.
-- GPU NVIDIA y NVIDIA Container Toolkit únicamente si se quiere entrenar con
-  aceleración CUDA.
+El dataset y el archivo `.h5` se distribuyen por separado y están ignorados por
+Git. Esta rama tampoco utiliza `docker-compose.yml`: PostgreSQL se inicia
+directamente con Docker.
 
-## Preparación del entorno
+## Guía de Ejecución Paso a Paso
 
-Desde la raíz del repositorio:
+Todos los comandos siguientes parten desde la raíz del repositorio, es decir, el
+directorio que contiene `SentinelAI-Backend`, `SentinelAI-Edge` y
+`SentinelAI-Model`.
+
+### 1. Seleccionar la rama de la demo
 
 ```bash
-python -m venv SentinelAI-Backend/.venv
-source SentinelAI-Backend/.venv/bin/activate
-pip install -r SentinelAI-Backend/requirements.txt
-pip install -r SentinelAI-Edge/requirements.txt
-cp SentinelAI-Backend/.env.example SentinelAI-Backend/.env
+git switch demo50
 ```
 
-El script de demostración define su propia `DATABASE_URL`. Para ejecutar el
-backend de forma manual, exportá la variable antes de iniciar Uvicorn o cargá el
-archivo `.env` con la herramienta que uses habitualmente.
+### 2. Levantar PostgreSQL
 
-## Dataset
-
-Los CSV originales de CIC-IDS2017 no se versionan. Descargalos desde su fuente y
-guardalos en `SentinelAI-Model/data/` para trabajar con el notebook.
-
-Para la demostración end-to-end, copiá el archivo que quieras reproducir:
+El siguiente comando inicia `sentinel-postgres` si ya existe; si es la primera
+ejecución, crea el contenedor con la imagen PostgreSQL 16 y las credenciales de
+la demo:
 
 ```bash
-cp SentinelAI-Model/data/Monday-WorkingHours.pcap_ISCX.csv \
-  SentinelAI-Edge/flujos_capturados.csv
+docker start sentinel-postgres 2>/dev/null || docker run \
+  --name sentinel-postgres \
+  -e POSTGRES_USER=sentinel_user \
+  -e POSTGRES_PASSWORD=sentinel_password \
+  -e POSTGRES_DB=sentinel_db \
+  -p 5432:5432 \
+  -d postgres:16
 ```
 
-El cliente admite las columnas numéricas del dataset y usa valores locales por
-defecto para las direcciones IP cuando el CSV no incluye `Src IP` o `Dst IP`.
-
-## Demostración end-to-end
-
-Con Docker activo, el entorno virtual preparado, los artefactos del modelo y el
-CSV en sus rutas:
+Comprobar que PostgreSQL acepta conexiones:
 
 ```bash
-./start_demo.sh
+docker exec sentinel-postgres pg_isready \
+  -U sentinel_user \
+  -d sentinel_db
 ```
 
-El orquestador:
+La salida esperada contiene `accepting connections`. Si el contenedor acaba de
+crearse y todavía está inicializándose, esperar unos segundos y repetir la
+comprobación.
 
-1. inicia o crea el contenedor `sentinel-postgres`;
-2. levanta la API en `http://localhost:8000`;
-3. valida el dataset inyectado en el módulo Edge;
-4. envía los flujos de forma secuencial y detiene el backend al terminar.
+### 3. Preparar y activar el entorno virtual
 
-PostgreSQL queda en ejecución para conservar las alertas entre demostraciones.
-Se puede detener manualmente con `docker stop sentinel-postgres`.
-
-## Ejecución manual
-
-### Backend
+Entrar al backend y crear el entorno solamente si todavía no existe:
 
 ```bash
-source SentinelAI-Backend/.venv/bin/activate
-export DATABASE_URL='postgresql://sentinel_user:sentinel_password@localhost:5432/sentinel_db'
 cd SentinelAI-Backend
-python -m uvicorn main:app --host 0.0.0.0 --port 8000
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+python -m pip install -r ../SentinelAI-Edge/requirements.txt
 ```
 
-La documentación interactiva queda disponible en
+En ejecuciones posteriores basta con:
+
+```bash
+cd SentinelAI-Backend
+source .venv/bin/activate
+```
+
+### 4. Verificar los artefactos requeridos
+
+Desde `SentinelAI-Backend`, ejecutar:
+
+```bash
+test -f ../SentinelAI-Model/models/sentinel_model.h5 && \
+  test -f ../SentinelAI-Model/models/sentinel_scaler.save && \
+  test -f ../SentinelAI-Model/data/Wednesday-workingHours.pcap_ISCX.csv && \
+  echo 'Artefactos y dataset disponibles.'
+```
+
+Si aparece el mensaje de confirmación, los tres archivos están en las rutas
+esperadas. Si no aparece, comprobar individualmente las rutas para identificar el
+archivo que falta.
+
+### 5. Iniciar el backend localmente
+
+Mantener abierta esta primera terminal, con el entorno virtual activo, y ejecutar:
+
+```bash
+export DATABASE_URL='postgresql://sentinel_user:sentinel_password@localhost:5432/sentinel_db'
+uvicorn main:app --host 0.0.0.0 --port 8000
+```
+
+Uvicorn debe informar que la aplicación completó el arranque y está disponible
+en `http://0.0.0.0:8000`. La documentación interactiva de la API queda en
 `http://localhost:8000/docs`.
 
-| Método | Endpoint | Uso |
-| --- | --- | --- |
-| `GET` | `/health` | Informa si el modelo y la base estaban disponibles al iniciar. |
-| `POST` | `/ingest` | Analiza un flujo y persiste la alerta cuando corresponde. |
+### 6. Abrir una terminal paralela y ejecutar el replay
 
-El cuerpo de `/ingest` tiene esta forma:
-
-```json
-{
-  "source_ip": "192.168.1.25",
-  "destination_ip": "10.0.0.8",
-  "destination_port": 443,
-  "features": [0.0, 0.0, 0.0]
-}
-```
-
-`features` puede ser una lista plana de 78 valores, una fila de 79 valores con
-`Label` al final o un objeto con los nombres de las características. El ejemplo
-abreviado de arriba solo muestra el formato; una solicitud real debe incluir las
-78 entradas esperadas.
-
-### Cliente Edge
+Sin cerrar la terminal del backend, abrir una segunda terminal. Volver a la raíz
+del repositorio y ejecutar:
 
 ```bash
-source SentinelAI-Backend/.venv/bin/activate
-cd SentinelAI-Edge
-python integracion_sensor.py
+cd SentinelAI-Backend
+source .venv/bin/activate
+curl http://127.0.0.1:8000/health
+cd ../SentinelAI-Edge
+python demo_replay.py
 ```
 
-La URL de la API y la ruta del dataset se pueden cambiar con `SENTINEL_API_URL` y
-`SENTINEL_CSV_FILE`, respectivamente.
+Es importante iniciar `demo_replay.py` desde `SentinelAI-Edge`, porque el script
+resuelve desde allí la ruta relativa al dataset de los miércoles.
 
-## Entrenamiento del modelo
+### 7. Interpretar la salida en pantalla
 
-Desde la raíz, Jupyter se puede iniciar con soporte para GPU:
+El replay anuncia primero la preparación de 100 flujos y luego imprime una línea
+por inferencia. Por ejemplo:
+
+```text
+[*] Cargando dataset para el Replay (Nivel 1)...
+[+] Dataset preparado. Iniciando inyección de 100 flujos...
+[001] REAL: BENIGN          | IA: 🟢 NORMAL             | MSE: 0.000012
+[002] REAL: DoS Hulk        | IA: 🚨 ANOMALÍA DETECTADA | MSE: 0.001234
+```
+
+La muestra contiene una selección reproducible de 80 etiquetas reales benignas y
+20 etiquetas reales de ataque, mezcladas en un orden aleatorio en cada ejecución.
+La cantidad de predicciones `NORMAL` y `ANOMALÍA DETECTADA` no tiene por qué
+coincidir con esa división: las diferencias representan falsos positivos o falsos
+negativos y son precisamente las que afectan a *Precision* y *Recall*.
+
+### 8. Verificar la persistencia de anomalías
+
+En la segunda terminal, una vez finalizado el replay, consultar las alertas más
+recientes:
 
 ```bash
-docker run -it --rm --runtime=nvidia --gpus all \
-  -v "$(pwd)/SentinelAI-Model:/tf/notebooks" \
-  -p 8888:8888 \
-  tensorflow/tensorflow:latest-gpu-jupyter
+docker exec -it sentinel-postgres \
+  psql -U sentinel_user -d sentinel_db \
+  -c 'SELECT id, timestamp, source_ip, destination_ip, destination_port, mse_score FROM alerts ORDER BY id DESC LIMIT 20;'
 ```
 
-Sin una GPU NVIDIA, usá `tensorflow/tensorflow:latest-jupyter` y quitá los flags
-`--runtime=nvidia --gpus all`.
+La tabla acumula resultados entre ejecuciones mientras se conserve el contenedor.
+Solo aparecerán los flujos que el backend clasificó como anómalos.
 
-El notebook entrena el autoencoder exclusivamente con tráfico benigno. La regla
-de detección es:
+### 9. Finalizar la demo
 
-$$L(x, \hat{x}) = \lVert x - \hat{x} \rVert^2 > \tau$$
+Presionar `Ctrl+C` en la primera terminal para detener Uvicorn. PostgreSQL puede
+quedar activo para otra ejecución o detenerse con:
 
-El scaler usado para entrenar debe conservarse junto al modelo: ambos tienen que
-esperar las mismas 78 características y en el mismo orden.
+```bash
+docker stop sentinel-postgres
+```
+
+## Problemas frecuentes
+
+### El dataset no se encuentra
+
+Confirmar que el nombre respeta mayúsculas y minúsculas:
+
+```text
+SentinelAI-Model/data/Wednesday-workingHours.pcap_ISCX.csv
+```
+
+### El endpoint `/health` devuelve estado degradado
+
+Revisar la terminal de Uvicorn. Las causas habituales son la ausencia de
+`sentinel_model.h5`, una incompatibilidad entre modelo y scaler o PostgreSQL aún
+no disponible durante el arranque.
+
+### PostgreSQL rechaza las credenciales
+
+Verificar que `DATABASE_URL` se haya exportado en la misma terminal donde se
+inicia Uvicorn. Si `sentinel-postgres` fue creado anteriormente con otras
+credenciales, se debe usar la configuración de ese contenedor o recrearlo de
+forma consciente; no borrar el contenedor si sus datos deben conservarse.
+
+### El puerto ya está ocupado
+
+Comprobar qué contenedores y procesos están usando los puertos de la demo:
+
+```bash
+docker ps
+ss -ltnp | grep -E ':(5432|8000)\b'
+```
+
+Las credenciales incluidas en esta guía son exclusivamente para un entorno local
+de demostración y no deben reutilizarse en producción.
