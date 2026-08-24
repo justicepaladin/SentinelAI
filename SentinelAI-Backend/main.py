@@ -415,9 +415,9 @@ def ingest(
         # Desempaquetamos la tupla
         mitigation_applied, is_new = _quarantine_source_ip(flow.source_ip)
         
-        # Solo disparamos el temporizador si acabamos de inyectar la regla
-        if is_new:
-            background_tasks.add_task(_remove_quarantine, source_ip, 60)
+        # Esto quita de cuarentena la IP después de 60 segundos, queda comentado para esta demo
+        # if is_new:
+        #     background_tasks.add_task(_remove_quarantine, source_ip, 60)
 
     if not anomaly:
         response_message = "Flow analyzed successfully; no anomaly detected"
