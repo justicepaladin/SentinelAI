@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import math
+import subprocess
 from collections.abc import Mapping, Sequence
 from contextlib import asynccontextmanager
 from numbers import Real
@@ -35,6 +36,7 @@ SCALER_PATH = (
 ).resolve()
 
 _PREDICTION_LOCK = Lock()
+_FIREWALL_LOCK = Lock()
 
 
 class NetworkFlow(BaseModel):
@@ -246,6 +248,64 @@ def _predict_mse(model: Any, scaler: Any, raw_features: Any) -> float:
     return mse_score
 
 
+def _quarantine_source_ip(source_ip: IPvAnyAddress) -> bool:
+    """Add an idempotent firewall rule for a detected IPv4 source."""
+
+    source_ip_text = str(source_ip)
+    if source_ip.version != 4:
+        logger.error(
+            "[-] No se puede aislar %s: esta demo solo administra reglas IPv4",
+            source_ip_text,
+        )
+        return False
+
+    if (
+        source_ip.is_loopback
+        or source_ip.is_unspecified
+        or source_ip.is_multicast
+        or source_ip.is_link_local
+    ):
+        logger.error("[-] Se rechazó el bloqueo de la IP protegida %s", source_ip_text)
+        return False
+
+    firewall = ["sudo", "-n", "iptables", "-w", "2"]
+    rule = ["INPUT", "-s", source_ip_text, "-j", "DROP"]
+
+    try:
+        with _FIREWALL_LOCK:
+            current_rule = subprocess.run(
+                [*firewall, "-C", *rule],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if current_rule.returncode == 0:
+                logger.info("[=] La IP %s ya estaba aislada", source_ip_text)
+                return True
+
+            subprocess.run(
+                [*firewall, "-I", "INPUT", "1", "-s", source_ip_text, "-j", "DROP"],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or str(exc)).strip()
+        logger.error("[-] Error al aplicar iptables para %s: %s", source_ip_text, detail)
+        return False
+    except subprocess.TimeoutExpired:
+        logger.error("[-] Tiempo de espera agotado al aislar %s", source_ip_text)
+        return False
+    except OSError as exc:
+        logger.error("[-] No se pudo ejecutar iptables para %s: %s", source_ip_text, exc)
+        return False
+
+    logger.info("[+] Regla de firewall aplicada con éxito para %s", source_ip_text)
+    return True
+
+
 @app.get("/health", response_model=HealthResponse, tags=["operations"])
 def health(request: Request) -> HealthResponse:
     ml_ready = request.app.state.model is not None and request.app.state.scaler is not None
@@ -294,9 +354,11 @@ def ingest(
         ) from exc
 
     anomaly = mse_score > TAU
+    mitigation_applied = False
     if anomaly:
+        source_ip = str(flow.source_ip)
         alert = Alert(
-            source_ip=str(flow.source_ip),
+            source_ip=source_ip,
             destination_ip=str(flow.destination_ip),
             destination_port=flow.destination_port,
             mse_score=mse_score,
@@ -312,12 +374,26 @@ def ingest(
                 detail="Anomaly detected, but PostgreSQL could not persist the alert",
             ) from exc
 
+        logger.warning(
+            "[!] ANOMALÍA DETECTADA (MSE: %.6f). Aislando IP: %s",
+            mse_score,
+            source_ip,
+        )
+        mitigation_applied = _quarantine_source_ip(flow.source_ip)
+
+    if not anomaly:
+        response_message = "Flow analyzed successfully; no anomaly detected"
+    elif mitigation_applied:
+        response_message = (
+            "Flow analyzed successfully; anomaly alert stored and source IP quarantined"
+        )
+    else:
+        response_message = (
+            "Flow analyzed successfully; anomaly alert stored, but source IP quarantine failed"
+        )
+
     return IngestResponse(
         mse_score=mse_score,
         anomaly=anomaly,
-        message=(
-            "Flow analyzed successfully; anomaly alert stored"
-            if anomaly
-            else "Flow analyzed successfully; no anomaly detected"
-        ),
+        message=response_message,
     )
