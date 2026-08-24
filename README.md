@@ -1,25 +1,47 @@
 # SentinelAI
 
-SentinelAI es un sistema de detección de anomalías en tráfico de red desarrollado
-como proyecto de tesis. El modelo aprende el comportamiento del tráfico benigno
-de CIC-IDS2017 y marca como anómalos los flujos cuyo error de reconstrucción
-supera el umbral configurado.
+SentinelAI es un sistema distribuido de detección y prevención de intrusiones
+(IDPS) para tráfico de red, desarrollado como Proyecto Final de Ingeniería. Su
+componente de Deep Learning aprende el comportamiento del tráfico benigno de
+CIC-IDS2017 y marca como anómalos los flujos cuyo error de reconstrucción supera
+el umbral configurado.
 
 El repositorio reúne el ciclo completo: preparación de datos, entrenamiento del
-autoencoder, inferencia mediante una API y envío de flujos desde un nodo Edge.
+autoencoder, inferencia mediante una API, envío de flujos desde un nodo Edge y
+persistencia de alertas para su posterior tratamiento.
 
-## Arquitectura
+## Estado del proyecto
+
+> **Estado:** Hito del 50% del Proyecto Final de Ingeniería completado.
+
+Este hito consolida el pipeline end-to-end de replay, inferencia, cálculo de MSE,
+clasificación y persistencia. La captura de tráfico en vivo desde el contenedor
+Edge y las acciones automáticas de contención forman parte de la evolución hacia
+el IDPS completo.
+
+## Arquitectura base de cuatro capas
+
+| Capa | Responsabilidad |
+| --- | --- |
+| **1. Edge/Sensor** | Contenedor Docker diseñado para capturar y transformar metadatos de red antes de enviarlos al backend. En las demos estables, la captura se sustituye por un replay controlado de flujos preprocesados. |
+| **2. Backend** | API REST asíncrona desarrollada con FastAPI. Expone `POST /ingest` para analizar flujos y `GET /health` para comprobar el estado de los servicios. |
+| **3. Inferencia** | Autoencoder no supervisado entrenado en TensorFlow con tráfico benigno. Reconstruye cada flujo normalizado y utiliza su error cuadrático medio (MSE) como señal de anomalía. |
+| **4. Persistencia y motor de reglas** | PostgreSQL conserva las alertas; el motor de reglas compara el MSE con el umbral y constituye la base de la respuesta activa. En este hito están implementadas la decisión por umbral y la persistencia de anomalías; la contención automática continúa en desarrollo. |
 
 ```text
-CIC-IDS2017 / sensor de red
-            │ CSV
-            ▼
-SentinelAI-Edge/integracion_sensor.py
-            │ POST /ingest
-            ▼
-SentinelAI-Backend (FastAPI)
-            ├── MinMaxScaler + autoencoder
-            └── PostgreSQL (solo anomalías)
+Tráfico de red / CIC-IDS2017
+              │
+              ▼
+     [1. Edge / Sensor]
+              │  metadatos de flujo
+              ▼
+       [2. API FastAPI]
+              │
+              ▼
+ [3. Scaler + Autoencoder]
+              │  MSE y clasificación
+              ▼
+[4. PostgreSQL + reglas de respuesta]
 ```
 
 El flujo de inferencia sigue estos pasos:
@@ -44,6 +66,20 @@ El flujo de inferencia sigue estos pasos:
 
 Los datasets, capturas, modelos Keras y archivos de log se mantienen fuera de Git
 por su tamaño o porque se generan durante la ejecución.
+
+## Estrategia de branching
+
+`main` concentra la línea de integración del proyecto y la documentación del
+estado actual. Los entornos de demostración estables se mantienen aislados en
+ramas específicas para que una presentación pueda repetirse sin depender de
+cambios todavía en desarrollo:
+
+- `demo50`: Demo Nivel 1 basada en el replay controlado de CIC-IDS2017.
+- `demo50lv2`: escenario de demostración Nivel 2 con componentes dockerizados.
+
+Estas ramas actúan como puntos de referencia reproducibles. Las mejoras de
+`main` se incorporan a cada demo de manera explícita y después de validarlas, en
+lugar de modificar automáticamente el entorno estable de presentación.
 
 ## Requisitos
 
@@ -169,7 +205,10 @@ Sin una GPU NVIDIA, usá `tensorflow/tensorflow:latest-jupyter` y quitá los fla
 El notebook entrena el autoencoder exclusivamente con tráfico benigno. La regla
 de detección es:
 
-$$L(x, \hat{x}) = \lVert x - \hat{x} \rVert^2 > \tau$$
+$$
+\operatorname{MSE}(x, \hat{x}) =
+\frac{1}{78}\sum_{i=1}^{78}(x_i-\hat{x}_i)^2 > \tau
+$$
 
 El scaler usado para entrenar debe conservarse junto al modelo: ambos tienen que
 esperar las mismas 78 características y en el mismo orden.
