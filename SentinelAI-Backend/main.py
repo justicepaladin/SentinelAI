@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
 import subprocess
@@ -14,7 +15,7 @@ from typing import Any, Annotated
 
 import numpy as np
 import pandas as pd
-from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request, status
 from pydantic import BaseModel, ConfigDict, Field, IPvAnyAddress
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -257,7 +258,7 @@ def _quarantine_source_ip(source_ip: IPvAnyAddress) -> bool:
             "[-] No se puede aislar %s: esta demo solo administra reglas IPv4",
             source_ip_text,
         )
-        return False
+        return False, False
 
     if (
         source_ip.is_loopback
@@ -266,7 +267,7 @@ def _quarantine_source_ip(source_ip: IPvAnyAddress) -> bool:
         or source_ip.is_link_local
     ):
         logger.error("[-] Se rechazó el bloqueo de la IP protegida %s", source_ip_text)
-        return False
+        return False, False
 
     firewall = ["sudo", "-n", "iptables", "-w", "2"]
     rule = ["INPUT", "-s", source_ip_text, "-j", "DROP"]
@@ -281,8 +282,8 @@ def _quarantine_source_ip(source_ip: IPvAnyAddress) -> bool:
                 timeout=5,
             )
             if current_rule.returncode == 0:
-                logger.info("[=] La IP %s ya estaba aislada", source_ip_text)
-                return True
+                logger.warning("[=] La IP %s ya estaba aislada", source_ip_text)
+                return True, False
 
             subprocess.run(
                 [*firewall, "-I", "INPUT", "1", "-s", source_ip_text, "-j", "DROP"],
@@ -294,16 +295,47 @@ def _quarantine_source_ip(source_ip: IPvAnyAddress) -> bool:
     except subprocess.CalledProcessError as exc:
         detail = (exc.stderr or str(exc)).strip()
         logger.error("[-] Error al aplicar iptables para %s: %s", source_ip_text, detail)
-        return False
+        return False, False
     except subprocess.TimeoutExpired:
         logger.error("[-] Tiempo de espera agotado al aislar %s", source_ip_text)
-        return False
+        return False, False
     except OSError as exc:
         logger.error("[-] No se pudo ejecutar iptables para %s: %s", source_ip_text, exc)
-        return False
+        return False, False
 
-    logger.info("[+] Regla de firewall aplicada con éxito para %s", source_ip_text)
-    return True
+    logger.warning("[+] Regla de firewall aplicada con éxito para %s", source_ip_text)
+    return True, True
+
+
+async def _remove_quarantine(source_ip: str, delay: int = 60) -> None:
+    """Remove the firewall rule after a specified delay to prevent self-DoS."""
+    await asyncio.sleep(delay)
+
+    firewall = ["sudo", "-n", "iptables", "-w", "2"]
+    rule = ["INPUT", "-s", source_ip, "-j", "DROP"]
+
+    try:
+        with _FIREWALL_LOCK:
+            subprocess.run(
+                [*firewall, "-D", *rule],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        logger.warning(
+            "[~] Cuarentena levantada para %s tras %s segundos",
+            source_ip,
+            delay,
+        )
+    except subprocess.CalledProcessError as exc:
+        logger.error(
+            "[-] Error al levantar cuarentena de %s: %s",
+            source_ip,
+            (exc.stderr or "").strip(),
+        )
+    except Exception as exc:
+        logger.error("[-] Fallo inesperado al borrar regla de %s: %s", source_ip, exc)
 
 
 @app.get("/health", response_model=HealthResponse, tags=["operations"])
@@ -326,6 +358,7 @@ def health(request: Request) -> HealthResponse:
 def ingest(
     flow: NetworkFlow,
     request: Request,
+    background_tasks: BackgroundTasks,
     db: Annotated[Session, Depends(get_db)],
 ) -> IngestResponse:
     """Classify a network flow and persist an alert when it is anomalous."""
@@ -379,7 +412,12 @@ def ingest(
             mse_score,
             source_ip,
         )
-        mitigation_applied = _quarantine_source_ip(flow.source_ip)
+        # Desempaquetamos la tupla
+        mitigation_applied, is_new = _quarantine_source_ip(flow.source_ip)
+        
+        # Solo disparamos el temporizador si acabamos de inyectar la regla
+        if is_new:
+            background_tasks.add_task(_remove_quarantine, source_ip, 60)
 
     if not anomaly:
         response_message = "Flow analyzed successfully; no anomaly detected"
