@@ -16,6 +16,7 @@ from typing import Any, Annotated
 import numpy as np
 import pandas as pd
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request, status
+from fastapi.responses import FileResponse, Response
 from prometheus_client import Counter, Gauge, make_asgi_app
 from pydantic import BaseModel, ConfigDict, Field, IPvAnyAddress
 from sqlalchemy.exc import SQLAlchemyError
@@ -165,6 +166,14 @@ app = FastAPI(
     description="Real-time intrusion detection using a pretrained autoencoder.",
     lifespan=lifespan,
 )
+
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon():
+    """Servir el icono de la pestaña o silenciar si no existe."""
+    ruta_icono = BACKEND_DIR / "favicon.ico"
+    if ruta_icono.is_file():
+        return FileResponse(ruta_icono)
+    return Response(status_code=204)
 
 # Prometheus consulta este endpoint para recolectar las métricas.
 metrics_app = make_asgi_app()
