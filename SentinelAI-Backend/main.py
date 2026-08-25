@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import os
 import subprocess
 from collections.abc import Mapping, Sequence
 from contextlib import asynccontextmanager
@@ -15,12 +16,17 @@ from typing import Any, Annotated
 
 import numpy as np
 import pandas as pd
+import requests
+from dotenv import load_dotenv
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request, status
 from fastapi.responses import FileResponse, Response
 from prometheus_client import Counter, Gauge, make_asgi_app
 from pydantic import BaseModel, ConfigDict, Field, IPvAnyAddress
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
+
+BACKEND_DIR = Path(__file__).resolve().parent
+load_dotenv(BACKEND_DIR / ".env")
 
 try:
     from .database import Alert, create_database_tables, get_db
@@ -32,7 +38,6 @@ logger = logging.getLogger("sentinelai")
 
 TAU = 0.000308
 
-BACKEND_DIR = Path(__file__).resolve().parent
 MODEL_PATH = (BACKEND_DIR / "../SentinelAI-Model/models/sentinel_model.h5").resolve()
 SCALER_PATH = (
     BACKEND_DIR / "../SentinelAI-Model/models/sentinel_scaler.save"
@@ -278,8 +283,8 @@ def _predict_mse(model: Any, scaler: Any, raw_features: Any) -> float:
     return mse_score
 
 
-def _quarantine_source_ip(source_ip: IPvAnyAddress) -> bool:
-    """Add an idempotent firewall rule for a detected IPv4 source."""
+def _quarantine_source_ip(source_ip: IPvAnyAddress) -> tuple[bool, bool]:
+    """Add an IPv4 firewall rule and report whether it was newly created."""
 
     source_ip_text = str(source_ip)
     if source_ip.version != 4:
@@ -367,6 +372,61 @@ async def _remove_quarantine(source_ip: str, delay: int = 60) -> None:
         logger.error("[-] Fallo inesperado al borrar regla de %s: %s", source_ip, exc)
 
 
+def _send_telegram_alert(source_ip: str, mse_score: float) -> None:
+    """Envía una notificación a Telegram usando la API oficial."""
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID")
+    if not token or not chat_id:
+        logger.error(
+            "[-] No se pudo enviar la alerta de Telegram: faltan las variables "
+            "TELEGRAM_BOT_TOKEN o TELEGRAM_CHAT_ID"
+        )
+        return
+
+    mensaje = (
+        "🚨 *ALERTA SentinelAI* 🚨\n\n"
+        "Se ha detectado y bloqueado tráfico anómalo.\n\n"
+        f"🛑 *IP de origen:* `{source_ip}`\n"
+        f"📈 *MSE Score:* `{mse_score:.6f}`"
+    )
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": mensaje,
+        "parse_mode": "Markdown",
+    }
+    try:
+        r = requests.post(url, json=payload, timeout=5)
+        
+        # Si Telegram nos rebota, imprimimos el motivo exacto:
+        if r.status_code != 200:
+            logger.error("[-] Telegram rechazó el mensaje: %s", r.text)
+            
+        r.raise_for_status()
+        logger.warning("[📱] Alerta de Telegram enviada exitosamente para %s", source_ip)
+            
+    except requests.exceptions.RequestException as exc:
+        logger.error("[-] Fallo de red/HTTP al enviar alerta: %s", exc)
+    except Exception as exc:
+        logger.error("[-] Error inesperado en Telegram: %s", exc)
+'''
+    try:
+        response = requests.post(url, json=payload, timeout=5)
+        response.raise_for_status()
+        logger.warning(
+            "[📱] Alerta de Telegram enviada exitosamente para %s",
+            source_ip,
+        )
+    except requests.RequestException as exc:
+        status_code = exc.response.status_code if exc.response is not None else "N/A"
+        logger.error(
+            "[-] Fallo al enviar alerta de Telegram: %s (HTTP %s)",
+            type(exc).__name__,
+            status_code,
+        )
+'''
+    
+
 @app.get("/health", response_model=HealthResponse, tags=["operations"])
 def health(request: Request) -> HealthResponse:
     ml_ready = request.app.state.model is not None and request.app.state.scaler is not None
@@ -449,12 +509,12 @@ def ingest(
             mse_score,
             source_ip,
         )
-        # Desempaquetamos la tupla
         mitigation_applied, is_new = _quarantine_source_ip(flow.source_ip)
-        
-        # Esto quita de cuarentena la IP después de 60 segundos, queda comentado para esta demo
-        # if is_new:
-        #     background_tasks.add_task(_remove_quarantine, source_ip, 60)
+        if is_new:
+            background_tasks.add_task(_send_telegram_alert, source_ip, mse_score)
+
+            # La cuarentena temporal queda desactivada para esta demo.
+            # background_tasks.add_task(_remove_quarantine, source_ip, 60)
 
     if not anomaly:
         response_message = "Flow analyzed successfully; no anomaly detected"

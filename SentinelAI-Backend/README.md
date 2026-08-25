@@ -10,7 +10,8 @@ cd SentinelAI-Backend
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-export DATABASE_URL='postgresql://user:password@localhost/sentinel_db'
+cp -n .env.example .env
+# Completá las credenciales de Telegram dentro de .env antes de iniciar la API.
 uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
