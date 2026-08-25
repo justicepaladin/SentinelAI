@@ -16,6 +16,7 @@ from typing import Any, Annotated
 import numpy as np
 import pandas as pd
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request, status
+from prometheus_client import Counter, Gauge, make_asgi_app
 from pydantic import BaseModel, ConfigDict, Field, IPvAnyAddress
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -38,6 +39,21 @@ SCALER_PATH = (
 
 _PREDICTION_LOCK = Lock()
 _FIREWALL_LOCK = Lock()
+
+# Métricas de observabilidad expuestas a Prometheus.
+PROM_FLOWS = Counter(
+    "sentinelai_flows_total",
+    "Total de flujos de red analizados",
+)
+PROM_ANOMALIES = Counter(
+    "sentinelai_anomalies_total",
+    "Total de anomalías detectadas",
+    ["source_ip"],
+)
+PROM_MSE = Gauge(
+    "sentinelai_mse_score",
+    "Último Error Cuadrático Medio (MSE) registrado",
+)
 
 
 class NetworkFlow(BaseModel):
@@ -149,6 +165,10 @@ app = FastAPI(
     description="Real-time intrusion detection using a pretrained autoencoder.",
     lifespan=lifespan,
 )
+
+# Prometheus consulta este endpoint para recolectar las métricas.
+metrics_app = make_asgi_app()
+app.mount("/metrics", metrics_app)
 
 
 def _flatten_numeric_values(value: Any) -> list[float]:
@@ -374,6 +394,10 @@ def ingest(
 
     try:
         mse_score = _predict_mse(model, scaler, flow.features)
+
+        # Solo contamos los flujos que completaron la inferencia.
+        PROM_MSE.set(mse_score)
+        PROM_FLOWS.inc()
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -390,6 +414,10 @@ def ingest(
     mitigation_applied = False
     if anomaly:
         source_ip = str(flow.source_ip)
+
+        # Separamos las anomalías por IP para poder seguir cada origen.
+        PROM_ANOMALIES.labels(source_ip=source_ip).inc()
+
         alert = Alert(
             source_ip=source_ip,
             destination_ip=str(flow.destination_ip),
