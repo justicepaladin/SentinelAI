@@ -6,7 +6,7 @@ import random
 
 # Configuración
 API_URL = "http://localhost:8000/ingest"
-# Ruta relativa a tu dataset del miércoles (que tiene ataques DoS)
+# Ruta relativa al dataset del miércoles (que tiene ataques DoS)
 CSV_FILE = "../SentinelAI-Model/data/Wednesday-workingHours.pcap_ISCX.csv" 
 
 def main():

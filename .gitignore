@@ -18,3 +18,4 @@
 
 # Salidas de ejecución
 *.log
+SentinelAI-Backend/logs/
