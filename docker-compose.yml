@@ -1,0 +1,12 @@
+version: '3.8'
+services:
+  victima:
+    image: nginx:alpine
+    container_name: sentinel-victima
+    ports:
+      - "8080:80"
+  
+  cliente:
+    image: alpine
+    container_name: sentinel-cliente
+    command: tail -f /dev/null
