@@ -97,5 +97,6 @@ def main():
             # Pausa de presentación; el envío en vivo no la necesita.
             time.sleep(0.3)
 
+
 if __name__ == "__main__":
     main()
