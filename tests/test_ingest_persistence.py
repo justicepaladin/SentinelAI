@@ -43,12 +43,20 @@ class IngestPersistenceTests(unittest.TestCase):
             features=[0.0] * 78,
         )
         self.request = Request({"type": "http", "app": main.app})
+        self.sensor = main.SensorIdentity(
+            sensor_id=7,
+            sensor_name="edge-a",
+            site_id=3,
+            site_slug="branch-a",
+            custom_mse_threshold=None,
+            active_response_enabled=True,
+        )
 
     def test_benign_flow_only_writes_local_traffic_log(self) -> None:
         with patch.object(main, "_predict_mse", return_value=0.00001), patch.object(
             main, "record_detection_state"
         ) as persist, patch.object(main, "_quarantine_source_ip") as quarantine:
-            result = main.ingest(self.flow, self.request, BackgroundTasks())
+            result = main.ingest(self.flow, self.request, BackgroundTasks(), self.sensor)
 
         self.assertFalse(result.anomaly)
         self.assertIsNone(result.dashboard_state_persisted)
@@ -62,7 +70,7 @@ class IngestPersistenceTests(unittest.TestCase):
         with patch.object(main, "_predict_mse", return_value=0.001), patch.object(
             main, "_quarantine_source_ip", return_value=(True, True)
         ), patch.object(main, "record_detection_state") as persist:
-            result = main.ingest(self.flow, self.request, background)
+            result = main.ingest(self.flow, self.request, background, self.sensor)
 
         self.assertTrue(result.anomaly)
         self.assertTrue(result.dashboard_state_persisted)
@@ -73,6 +81,8 @@ class IngestPersistenceTests(unittest.TestCase):
         kwargs = persist.call_args.kwargs
         self.assertTrue(kwargs["newly_quarantined"])
         self.assertTrue(kwargs["critical"])
+        self.assertEqual(kwargs["site_id"], 3)
+        self.assertEqual(kwargs["sensor_id"], 7)
         self.assertNotIn("features", kwargs)
 
     def test_postgres_outage_keeps_detection_in_local_log(self) -> None:
@@ -81,7 +91,7 @@ class IngestPersistenceTests(unittest.TestCase):
         ), patch.object(
             main, "record_detection_state", side_effect=SQLAlchemyError("offline")
         ):
-            result = main.ingest(self.flow, self.request, BackgroundTasks())
+            result = main.ingest(self.flow, self.request, BackgroundTasks(), self.sensor)
 
         self.assertTrue(result.anomaly)
         self.assertFalse(result.dashboard_state_persisted)
@@ -106,8 +116,36 @@ class IngestPersistenceTests(unittest.TestCase):
         with patch.object(main.subprocess, "run", return_value=denied), patch.object(
             main, "release_quarantine_state"
         ) as release:
-            asyncio.run(main._remove_quarantine("192.0.2.25", delay=0))
+            asyncio.run(main._remove_quarantine(3, "192.0.2.25", delay=0))
         release.assert_not_called()
+
+    def test_site_response_flag_skips_firewall_and_uses_site_threshold(self) -> None:
+        sensor = main.SensorIdentity(
+            sensor_id=8,
+            sensor_name="edge-b",
+            site_id=4,
+            site_slug="branch-b",
+            custom_mse_threshold=0.002,
+            active_response_enabled=False,
+        )
+        with patch.object(main, "_predict_mse", return_value=0.001), patch.object(
+            main, "_quarantine_source_ip"
+        ) as quarantine, patch.object(main, "record_detection_state") as persist:
+            result = main.ingest(self.flow, self.request, BackgroundTasks(), sensor)
+        self.assertFalse(result.anomaly)
+        quarantine.assert_not_called()
+        persist.assert_not_called()
+
+        with patch.object(main, "_predict_mse", return_value=0.007), patch.object(
+            main, "_quarantine_source_ip"
+        ) as quarantine, patch.object(main, "record_detection_state") as persist:
+            result = main.ingest(self.flow, self.request, BackgroundTasks(), sensor)
+        self.assertTrue(result.anomaly)
+        self.assertIn("disabled", result.message)
+        quarantine.assert_not_called()
+        persist.assert_called_once()
+        self.assertEqual(persist.call_args.kwargs["site_id"], 4)
+        self.assertFalse(persist.call_args.kwargs["newly_quarantined"])
 
 
 if __name__ == "__main__":

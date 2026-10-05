@@ -15,13 +15,13 @@ from datetime import datetime, timezone
 from numbers import Real
 from pathlib import Path
 from threading import Lock
-from typing import Any
+from typing import Any, Annotated
 
 import numpy as np
 import pandas as pd
 import requests
 from dotenv import load_dotenv
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, status
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request, status
 from fastapi.responses import FileResponse, Response
 from prometheus_client import Counter, Gauge, make_asgi_app
 from pydantic import BaseModel, ConfigDict, Field, IPvAnyAddress
@@ -31,6 +31,7 @@ BACKEND_DIR = Path(__file__).resolve().parent
 load_dotenv(BACKEND_DIR / ".env")
 
 try:
+    from .auth import SensorIdentity, get_authenticated_sensor
     from .database import create_database_tables
     from .state_store import (
         list_current_state,
@@ -40,6 +41,7 @@ try:
     )
     from .traffic_logging import AuditLogWriter
 except ImportError:  # También permite iniciar Uvicorn desde SentinelAI-Backend.
+    from auth import SensorIdentity, get_authenticated_sensor
     from database import create_database_tables
     from state_store import (
         list_current_state,
@@ -77,28 +79,29 @@ SCALER_PATH = (
 _PREDICTION_LOCK = Lock()
 _FIREWALL_LOCK = Lock()
 _STATE_WRITE_LOCK = Lock()
-_CRITICAL_WRITE_CACHE: OrderedDict[str, float] = OrderedDict()
+_CRITICAL_WRITE_CACHE: OrderedDict[tuple[int, str], float] = OrderedDict()
 _CRITICAL_WRITE_CACHE_SIZE = 10_000
 
 
-def _reserve_critical_snapshot(source_ip: str) -> bool:
+def _reserve_critical_snapshot(site_id: int, source_ip: str) -> bool:
     """Avoid a PostgreSQL transaction for every flow in an ongoing attack."""
 
     now = time.monotonic()
+    key = (site_id, source_ip)
     with _STATE_WRITE_LOCK:
-        previous = _CRITICAL_WRITE_CACHE.get(source_ip)
+        previous = _CRITICAL_WRITE_CACHE.get(key)
         if previous is not None and now - previous < ALERT_UPDATE_SECONDS:
             return False
-        _CRITICAL_WRITE_CACHE[source_ip] = now
-        _CRITICAL_WRITE_CACHE.move_to_end(source_ip)
+        _CRITICAL_WRITE_CACHE[key] = now
+        _CRITICAL_WRITE_CACHE.move_to_end(key)
         if len(_CRITICAL_WRITE_CACHE) > _CRITICAL_WRITE_CACHE_SIZE:
             _CRITICAL_WRITE_CACHE.popitem(last=False)
         return True
 
 
-def _forget_critical_snapshot(source_ip: str) -> None:
+def _forget_critical_snapshot(site_id: int, source_ip: str) -> None:
     with _STATE_WRITE_LOCK:
-        _CRITICAL_WRITE_CACHE.pop(source_ip, None)
+        _CRITICAL_WRITE_CACHE.pop((site_id, source_ip), None)
 
 # Métricas de observabilidad expuestas a Prometheus.
 PROM_FLOWS = Counter(
@@ -108,7 +111,7 @@ PROM_FLOWS = Counter(
 PROM_ANOMALIES = Counter(
     "sentinelai_anomalies_total",
     "Total de anomalías detectadas",
-    ["source_ip"],
+    ["site_id"],
 )
 PROM_MSE = Gauge(
     "sentinelai_mse_score",
@@ -251,6 +254,7 @@ async def lifespan(app: FastAPI):
             )
             task = asyncio.create_task(
                 _remove_quarantine(
+                    quarantine.site_id,
                     quarantine.source_ip,
                     remaining,
                     quarantine.mse_score,
@@ -455,6 +459,7 @@ def _quarantine_source_ip(source_ip: IPvAnyAddress) -> tuple[bool, bool]:
 
 
 async def _remove_quarantine(
+    site_id: int,
     source_ip: str,
     delay: int = 60,
     mse_score: float | None = None,
@@ -493,9 +498,13 @@ async def _remove_quarantine(
                 )
 
         try:
-            release_quarantine_state(source_ip)
+            release_quarantine_state(site_id, source_ip)
         except SQLAlchemyError:
-            logger.exception("Firewall released %s, but its DB state could not be cleared", source_ip)
+            logger.exception(
+                "Firewall released %s for site %s, but its DB state could not be cleared",
+                source_ip,
+                site_id,
+            )
 
         if current_rule.returncode == 0:
             logger.warning(
@@ -512,6 +521,7 @@ async def _remove_quarantine(
             try:
                 app.state.audit_log.log_detection(
                     action="quarantine_released",
+                    site_id=site_id,
                     source_ip=source_ip,
                     rule_was_present=current_rule.returncode == 0,
                 )
@@ -579,12 +589,14 @@ def _send_telegram_alert(
         logger.error("[-] Error inesperado en Telegram: %s", exc)
 
 
-async def _notify_and_release_quarantine(source_ip: str, mse_score: float) -> None:
+async def _notify_and_release_quarantine(
+    site_id: int, source_ip: str, mse_score: float
+) -> None:
     """Start the timer and Telegram delivery together after the HTTP response."""
 
     await asyncio.gather(
         asyncio.to_thread(_send_telegram_alert, source_ip, mse_score, True),
-        _remove_quarantine(source_ip, QUARANTINE_SECONDS, mse_score),
+        _remove_quarantine(site_id, source_ip, QUARANTINE_SECONDS, mse_score),
     )
 
 
@@ -602,11 +614,13 @@ def health(request: Request) -> HealthResponse:
 
 
 @app.get("/dashboard/state", response_model=DashboardState, tags=["operations"])
-def dashboard_state() -> DashboardState:
-    """Expose only live quarantine and recent critical alert snapshots."""
+def dashboard_state(
+    sensor: Annotated[SensorIdentity, Depends(get_authenticated_sensor)],
+) -> DashboardState:
+    """Expose live state only for the authenticated sensor's site."""
 
     try:
-        quarantines, alerts = list_current_state()
+        quarantines, alerts = list_current_state(sensor.site_id)
     except SQLAlchemyError as exc:
         logger.exception("Could not load dashboard state")
         raise HTTPException(
@@ -651,6 +665,7 @@ def ingest(
     flow: NetworkFlow,
     request: Request,
     background_tasks: BackgroundTasks,
+    sensor: Annotated[SensorIdentity, Depends(get_authenticated_sensor)],
 ) -> IngestResponse:
     """Classify, audit locally, and persist only live response state."""
 
@@ -687,13 +702,19 @@ def ingest(
             detail="The network flow could not be analyzed",
         ) from exc
 
-    anomaly = mse_score > TAU
-    critical = mse_score >= CRITICAL_MSE
+    threshold = sensor.custom_mse_threshold or TAU
+    critical_threshold = max(CRITICAL_MSE, threshold * 3)
+    anomaly = mse_score > threshold
+    critical = mse_score >= critical_threshold
     source_ip = str(flow.source_ip)
     destination_ip = str(flow.destination_ip)
 
     try:
         audit_log.log_traffic(
+            site_id=sensor.site_id,
+            site_slug=sensor.site_slug,
+            sensor_id=sensor.sensor_id,
+            sensor_name=sensor.sensor_name,
             source_ip=source_ip,
             destination_ip=destination_ip,
             destination_port=flow.destination_port,
@@ -712,23 +733,31 @@ def ingest(
     mitigation_applied = False
     dashboard_state_persisted: bool | None = None
     if anomaly:
-        # Separamos las anomalías por IP para poder seguir cada origen.
-        PROM_ANOMALIES.labels(source_ip=source_ip).inc()
+        PROM_ANOMALIES.labels(site_id=str(sensor.site_id)).inc()
 
         logger.warning(
-            "[!] ANOMALÍA DETECTADA (MSE: %.6f). Aislando IP: %s",
+            "[!] ANOMALÍA DETECTADA en sitio %s (MSE: %.6f, IP: %s)",
+            sensor.site_slug,
             mse_score,
             source_ip,
         )
-        mitigation_applied, is_new = _quarantine_source_ip(flow.source_ip)
+        is_new = False
+        if sensor.active_response_enabled:
+            mitigation_applied, is_new = _quarantine_source_ip(flow.source_ip)
         if is_new:
             # La cuarentena temporal se libera aun si PostgreSQL falla.
-            background_tasks.add_task(_notify_and_release_quarantine, source_ip, mse_score)
+            background_tasks.add_task(
+                _notify_and_release_quarantine, sensor.site_id, source_ip, mse_score
+            )
 
-        write_critical_snapshot = critical and _reserve_critical_snapshot(source_ip)
+        write_critical_snapshot = critical and _reserve_critical_snapshot(
+            sensor.site_id, source_ip
+        )
         if is_new or write_critical_snapshot:
             try:
                 record_detection_state(
+                    site_id=sensor.site_id,
+                    sensor_id=sensor.sensor_id,
                     source_ip=source_ip,
                     destination_ip=destination_ip,
                     destination_port=flow.destination_port,
@@ -742,20 +771,25 @@ def ingest(
                 dashboard_state_persisted = True
             except SQLAlchemyError:
                 if write_critical_snapshot:
-                    _forget_critical_snapshot(source_ip)
+                    _forget_critical_snapshot(sensor.site_id, source_ip)
                 dashboard_state_persisted = False
                 logger.exception("Could not update the PostgreSQL dashboard state")
 
         try:
             audit_log.log_detection(
                 action="anomaly_detected",
+                site_id=sensor.site_id,
+                site_slug=sensor.site_slug,
+                sensor_id=sensor.sensor_id,
+                sensor_name=sensor.sensor_name,
                 source_ip=source_ip,
                 destination_ip=destination_ip,
                 destination_port=flow.destination_port,
                 mse_score=mse_score,
-                threshold=TAU,
+                threshold=threshold,
                 critical=critical,
-                critical_threshold=CRITICAL_MSE,
+                critical_threshold=critical_threshold,
+                active_response_enabled=sensor.active_response_enabled,
                 mitigation_applied=mitigation_applied,
                 quarantine_new=is_new,
                 dashboard_state_persisted=dashboard_state_persisted,
@@ -771,6 +805,8 @@ def ingest(
         response_message = "Flow analyzed successfully; no anomaly detected"
     elif mitigation_applied:
         response_message = "Anomaly recorded locally and source IP quarantined"
+    elif not sensor.active_response_enabled:
+        response_message = "Anomaly recorded locally; active response is disabled for this site"
     else:
         response_message = "Anomaly recorded locally, but source IP quarantine failed"
 

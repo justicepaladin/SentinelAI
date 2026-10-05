@@ -4,7 +4,14 @@
 # SentinelAI - Demo Orchestration Script
 # ==========================================
 
-BASE_DIR="/home/facundo/SentinelAI"
+BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# El token se hereda por la ventana Edge; nunca se escribe ni se imprime aquí.
+if [[ -z "${SENTINEL_SENSOR_TOKEN:-}" ]]; then
+    echo "[!] Falta SENTINEL_SENSOR_TOKEN. Aprovisioná un sensor y exportá su token antes de iniciar la demo." >&2
+    exit 1
+fi
+export SENTINEL_SENSOR_TOKEN
 
 echo "[+] Iniciando orquestación interactiva de la demo..."
 echo "----------------------------------------------------"
@@ -13,7 +20,7 @@ echo "----------------------------------------------------"
 # TERMINAL 1: Base de Datos y Monitoreo de Firewall
 # ---------------------------------------------------------
 echo "[1/3] Levantando PostgreSQL y monitoreo de iptables..."
-ptyxis -- bash -c "
+env -u SENTINEL_SENSOR_TOKEN ptyxis -- bash -c "
     echo '=> Verificando contenedor sentinel-postgres...';
     if [ \$(docker ps -a -q -f name=sentinel-postgres) ]; then
         echo 'Contenedor encontrado. Iniciando...';
@@ -42,7 +49,7 @@ read -p "👉 Presionar ENTER cuando el watch esté corriendo para lanzar el Bac
 # ---------------------------------------------------------
 echo ""
 echo "[2/3] Levantando Backend (Uvicorn)..."
-ptyxis -- bash -c "
+env -u SENTINEL_SENSOR_TOKEN ptyxis -- bash -c "
     cd $BASE_DIR/SentinelAI-Backend || exit;
     echo '=> Iniciando Uvicorn...';
     sudo .venv/bin/python -m uvicorn main:app --host 0.0.0.0 --port 8000;
@@ -77,22 +84,20 @@ PID_TERM3=$!
 echo ""
 echo "[+] ¡Boom! 🚀 Ataque inyectado. La orquestación está completa."
 echo "[+] en localhost:8000/metrics vamos a poder visualizar las métricas"
-read -p "👉 Presioná ENTER para finalizar la demo..."
+read -p "👉 Presioná ENTER cuando termine el replay. El backend seguirá activo hasta liberar las cuarentenas..."
 
 # ---------------------------------------------------------
 # FINALIZACIÓN DE DEMO
 # ---------------------------------------------------------
 echo ""
-echo "[+] Finalizando la demo..."
+echo "[+] Finalizando la presentación..."
 
-echo "=> Cerrando terminales secundarias..."
-kill $PID_TERM1 $PID_TERM2 $PID_TERM3 2>/dev/null
+echo "=> Cerrando el monitor y la ventana Edge..."
+kill "$PID_TERM1" "$PID_TERM3" 2>/dev/null
 
-echo "=> Limpiando iptables (poner contraseña de sudo)"
-sudo iptables -F INPUT
-
-echo "=> Apagando contenedor PostgreSQL..."
-docker stop sentinel-postgres
+echo "=> Backend y PostgreSQL siguen activos para que el temporizador quite las reglas de cuarentena."
+echo "=> Cuando el backend confirme las liberaciones, detenelo con Ctrl+C y ejecutá: docker stop sentinel-postgres"
+echo "=> Este script no borra reglas generales de iptables."
 
 echo "----------------------------------------------------"
 echo "[+] ¡Finalizó la demo! Gracias a todos por ver :)" 
