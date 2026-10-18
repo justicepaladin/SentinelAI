@@ -42,7 +42,7 @@ El replay usa datos ya procesados de CIC-IDS2017. No captura paquetes de red en 
 | `scripts/benchmark_rnf.py` | Latencias y políticas RNF con el modelo real y colaboradores en memoria. |
 | `scripts/archive_logs.py` | Archivo de logs antiguos para cron. |
 | `docker-compose.yml` | Laboratorio opcional con un servidor Nginx `victima` y un contenedor Alpine `cliente`. |
-| `start_demo.sh` | Orquestación interactiva de la demo en el entorno local original. |
+| `start_demo.sh` | Orquestador de cuatro terminales y consola interactiva para demostrar el avance del 75 %. |
 
 ## 3. Preparación y ejecución de la demo
 
@@ -118,7 +118,39 @@ Pegar en la lectura silenciosa sólo el valor del token emitido, sin el prefijo 
 
 El sensor usa `SENTINEL_SENSOR_TOKEN` para enviar `Authorization: Bearer <token>`; el backend obtiene el sensor y el sitio desde ese token. El Edge no envía `site_id` como dato confiable. Puede agregar `link_degraded` al flujo cuando su monitor de enlace detecte degradación. `SENTINEL_API_URL`, `SENTINEL_CSV_FILE`, `SENTINEL_CSV_CHUNK_SIZE` y `SENTINEL_FLOW_DELAY` controlan el replay por bloques; `SENTINEL_REPLAY_CSV_FILE` cambia el CSV de `demo_replay.py`.
 
-`start_demo.sh` abre ventanas con `ptyxis`, inicia el contenedor local de PostgreSQL y usa `sudo` para la demo de `iptables`. Exige `SENTINEL_SENSOR_TOKEN` exportado antes de iniciar, pero no aprovisiona el sensor; sólo la ventana Edge hereda ese token. Al terminar la presentación deja el backend y PostgreSQL activos para que las liberaciones temporizadas puedan completarse; después hay que detener Uvicorn con `Ctrl+C` y, si corresponde, ejecutar `docker stop sentinel-postgres`. El script no vacía la cadena `INPUT` ni elimina reglas ajenas a SentinelAI. Para observar el bloqueo hace falta un sitio creado con `--active-response` y permisos `sudo -n iptables` para el proceso backend.
+### Orquestador completo de la demo del 75 %
+
+`start_demo.sh` automatiza la ejecución local que en la entrega del 50 % se hacía con varias terminales. Requiere `ptyxis`, Docker, `curl`, `sha256sum`, el entorno virtual preparado y los artefactos/dataset indicados arriba. El aprovisionamiento y las migraciones son pasos deliberadamente separados: no modifica un esquema anterior ni crea un sensor sin que el operador conserve antes el respaldo y los tokens.
+
+Antes de usarlo, generar una vez el token administrador, copiar su hash hexadecimal a `SENTINEL_ADMIN_TOKEN_SHA256` en `SentinelAI-Backend/.env` y conservar el valor original sólo en la terminal de la presentación:
+
+```bash
+export TOKEN_ADMIN="$(SentinelAI-Backend/.venv/bin/python -c \
+  'import secrets; print(secrets.token_urlsafe(48))')"
+printf '%s' "$TOKEN_ADMIN" | sha256sum
+```
+
+Después de aprovisionar el sensor, exportar su token y ejecutar desde la raíz:
+
+```bash
+export SENTINEL_SENSOR_TOKEN='<valor emitido por provision_sensor.py>'
+./start_demo.sh --site-id 1 --sensor-id 1
+```
+
+Los IDs predeterminados son `1`. En una base que ya contenía otros sitios, indicar los IDs correspondientes mediante los argumentos o las variables `SENTINEL_SITE_ID` y `SENTINEL_SENSOR_ID`. `./start_demo.sh --help` muestra todas las opciones. `--no-replay` abre la terminal Edge sin enviar inmediatamente los 100 flujos.
+
+El lanzador valida archivos, token administrador y disponibilidad de la API; inicia o reutiliza el contenedor `sentinel-postgres`, espera a PostgreSQL, abre FastAPI con un solo worker y comprueba que ML, base y auditoría estén listos. Después abre cuatro terminales con este reparto:
+
+| Terminal | Función | Secretos heredados |
+| --- | --- | --- |
+| Firewall | `watch` sobre la cadena `INPUT` de `iptables`. | Ninguno. |
+| Backend | Uvicorn y salida de detecciones/liberaciones. | Ninguno; lee configuración hasheada desde `.env`. |
+| Edge | Replay inicial de 80 benignos y 20 ataques. | Token del sensor. |
+| Consola 75 % | Configuración, heartbeat, telemetría, alertas, dashboard, reversión, benchmark y análisis del umbral. | Tokens de sensor y administrador. |
+
+La secuencia recomendada en la consola es: consultar configuración; activar respuesta y reportar enlace sano; repetir el replay observando `iptables`; reportar enlace degradado y repetirlo para comprobar que continúa la detección sin nuevos bloqueos; recuperar el enlace, activar modo informativo y repetir; finalmente consultar alertas/telemetría o revertir una cuarentena. El menú también permite regenerar los dos informes medidos.
+
+La terminal del backend valida primero la credencial con `sudo -v`, mantiene vigente esa autorización mientras Uvicorn está abierto y ejecuta la API como el usuario normal; las operaciones puntuales de `iptables` usan `sudo -n`. Al terminar, usar `Ctrl+C` en Backend y Firewall y, después de permitir que terminen las liberaciones necesarias, ejecutar `docker stop sentinel-postgres`. El script no vacía `INPUT`, no elimina reglas ajenas a SentinelAI y no detiene automáticamente servicios para evitar cortar una cuarentena a mitad de su auditoría. Para una base externa ya administrada se puede usar `SENTINEL_DEMO_SKIP_POSTGRES=1`.
 
 ### Laboratorio Docker de `demo50lv2`
 
@@ -369,6 +401,10 @@ Los valores exactos y parámetros de la corrida están en `SentinelAI-Model/repo
 | `SENTINEL_FLOW_DELAY` | Pausa de `integracion_sensor.py` en segundos; por defecto 0,5. |
 | `SENTINEL_REPLAY_CSV_FILE` | CSV del replay de 100 flujos; por defecto el miércoles de CIC-IDS2017 bajo `SentinelAI-Model/data/`. |
 | `SENTINEL_SENSOR_TOKEN` | Token Bearer del sensor Edge, emitido al aprovisionarlo; no pertenece al `.env` del backend. |
+| `TOKEN_ADMIN` | Token administrador en texto plano, exportado sólo en la terminal que ejecuta `start_demo.sh`; el backend recibe únicamente su hash desde `.env`. |
+| `SENTINEL_SITE_ID`, `SENTINEL_SENSOR_ID` | IDs usados por la consola del lanzador; equivalen a `--site-id` y `--sensor-id`. |
+| `SENTINEL_DEMO_POSTGRES_CONTAINER` | Nombre del contenedor local que inicia el lanzador; por defecto `sentinel-postgres`. |
+| `SENTINEL_DEMO_SKIP_POSTGRES` | Con valor `1`, evita administrar un contenedor local cuando `DATABASE_URL` apunta a una base externa. |
 | `SentinelAI-Model/models/sentinel_scaler.save` | Normalización ajustada durante el entrenamiento. |
 | `SentinelAI-Model/models/sentinel_model.h5` | Autoencoder Keras entrenado; no versionado. |
 

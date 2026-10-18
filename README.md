@@ -15,8 +15,19 @@ La [documentación completa](docs/README.md) incluye arquitectura, instalación,
 - [`scripts/archive_logs.py`](scripts/archive_logs.py): archivado seguro de logs antiguos.
 - [`scripts/benchmark_rnf.py`](scripts/benchmark_rnf.py): medición local de inferencia y `/ingest` con pruebas RNF-05/06.
 - [`SentinelAI-Model/threshold_analysis.py`](SentinelAI-Model/threshold_analysis.py): normalidad y FPR/F1 para cuatro alternativas de umbral.
+- [`start_demo.sh`](start_demo.sh): inicia PostgreSQL, abre Backend/Edge/firewall y ofrece una consola para recorrer las funciones del 75 %.
 - [`docker-compose.yml`](docker-compose.yml): cliente y víctima de la demo de nivel 2.
 
 Los CSV y el archivo `sentinel_model.h5` se mantienen fuera de Git; deben estar disponibles localmente para repetir inferencia y evaluación.
 
 Una instalación con tablas de `new-fix-50` debe respaldar PostgreSQL y ejecutar [migrate_75.py](SentinelAI-Backend/migrate_75.py). Si parte de `fix-50%`, ejecutar antes [migrate_multisite.py](SentinelAI-Backend/migrate_multisite.py). `create_all()` no cambia las columnas ni restricciones previas; la [guía de migración](docs/README.md#migración-de-una-base-existente) describe el procedimiento.
+
+Con el entorno, la base y los tokens preparados, la demo completa se inicia desde la raíz con:
+
+```bash
+export SENTINEL_SENSOR_TOKEN='<token del sensor>'
+export TOKEN_ADMIN='<token administrador sin hashear>'
+./start_demo.sh --site-id 1 --sensor-id 1
+```
+
+El procedimiento inicial, el contenido de cada terminal y el recorrido sugerido están en la [guía completa](docs/README.md).

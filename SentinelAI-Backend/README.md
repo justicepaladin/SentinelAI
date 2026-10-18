@@ -36,6 +36,8 @@ uvicorn main:app --host 0.0.0.0 --port 8000
 
 La documentación interactiva está en `http://localhost:8000/docs`. Para la demo actual se recomienda un solo worker: `iptables`, el control temporal de escrituras y la liberación programada todavía dependen de estado local del proceso.
 
+Para la presentación completa, [start_demo.sh](../start_demo.sh) realiza los chequeos previos, inicia PostgreSQL y abre terminales separadas para Uvicorn, Edge, el monitor de `iptables` y una consola de las funciones del 75 %. Requiere exportar previamente `SENTINEL_SENSOR_TOKEN` y el token administrador sin hashear como `TOKEN_ADMIN`. El procedimiento está en la [documentación principal](../docs/README.md).
+
 ## Contrato HTTP
 
 | Endpoint | Autenticación | Resultado |
