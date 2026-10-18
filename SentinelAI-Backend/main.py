@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import logging
 import math
 import os
@@ -10,44 +11,58 @@ import subprocess
 import time
 from collections import OrderedDict
 from collections.abc import Mapping, Sequence
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from datetime import datetime, timezone
 from numbers import Real
 from pathlib import Path
-from threading import Lock
-from typing import Any, Annotated
+from threading import Lock, RLock
+from typing import Any, Annotated, Literal
 
 import numpy as np
 import pandas as pd
 import requests
 from dotenv import load_dotenv
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request, status
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.responses import FileResponse, Response
 from prometheus_client import Counter, Gauge, make_asgi_app
-from pydantic import BaseModel, ConfigDict, Field, IPvAnyAddress
+from pydantic import BaseModel, ConfigDict, Field, IPvAnyAddress, field_validator
 from sqlalchemy.exc import SQLAlchemyError
 
 BACKEND_DIR = Path(__file__).resolve().parent
 load_dotenv(BACKEND_DIR / ".env")
 
 try:
-    from .auth import SensorIdentity, get_authenticated_sensor
+    from .auth import (AdminIdentity, SensorIdentity, get_authenticated_admin,
+                       get_authenticated_reader, get_authenticated_sensor)
     from .database import create_database_tables
     from .state_store import (
         list_current_state,
+        list_alerts,
+        find_active_quarantines,
+        get_sensor_telemetry,
+        get_site_config,
         list_quarantines_for_recovery,
         record_detection_state,
         release_quarantine_state,
+        update_sensor_telemetry,
+        update_site_config,
     )
     from .traffic_logging import AuditLogWriter
 except ImportError:  # También permite iniciar Uvicorn desde SentinelAI-Backend.
-    from auth import SensorIdentity, get_authenticated_sensor
+    from auth import (AdminIdentity, SensorIdentity, get_authenticated_admin,
+                      get_authenticated_reader, get_authenticated_sensor)
     from database import create_database_tables
     from state_store import (
         list_current_state,
+        list_alerts,
+        find_active_quarantines,
+        get_sensor_telemetry,
+        get_site_config,
         list_quarantines_for_recovery,
         record_detection_state,
         release_quarantine_state,
+        update_sensor_telemetry,
+        update_site_config,
     )
     from traffic_logging import AuditLogWriter
 
@@ -70,6 +85,7 @@ if not math.isfinite(CRITICAL_MSE) or CRITICAL_MSE <= TAU:
 QUARANTINE_SECONDS = _positive_int_setting("SENTINEL_QUARANTINE_SECONDS", 60)
 ALERT_TTL_HOURS = _positive_int_setting("SENTINEL_ALERT_TTL_HOURS", 24)
 ALERT_UPDATE_SECONDS = _positive_int_setting("SENTINEL_ALERT_UPDATE_SECONDS", 300)
+LINK_STATE_TTL_SECONDS = _positive_int_setting("SENTINEL_LINK_STATE_TTL_SECONDS", 120)
 
 MODEL_PATH = (BACKEND_DIR / "../SentinelAI-Model/models/sentinel_model.h5").resolve()
 SCALER_PATH = (
@@ -77,7 +93,8 @@ SCALER_PATH = (
 ).resolve()
 
 _PREDICTION_LOCK = Lock()
-_FIREWALL_LOCK = Lock()
+_FIREWALL_LOCK = RLock()
+_QUARANTINE_GENERATIONS: dict[tuple[int, str], object] = {}
 _STATE_WRITE_LOCK = Lock()
 _CRITICAL_WRITE_CACHE: OrderedDict[tuple[int, str], float] = OrderedDict()
 _CRITICAL_WRITE_CACHE_SIZE = 10_000
@@ -102,6 +119,28 @@ def _reserve_critical_snapshot(site_id: int, source_ip: str) -> bool:
 def _forget_critical_snapshot(site_id: int, source_ip: str) -> None:
     with _STATE_WRITE_LOCK:
         _CRITICAL_WRITE_CACHE.pop((site_id, source_ip), None)
+
+
+_INTERNAL_NETWORKS = tuple(ipaddress.ip_network(cidr) for cidr in (
+    "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7",
+))
+
+
+def _is_unrecognized_device(source_ip: IPvAnyAddress, known_devices: Sequence[str]) -> bool:
+    """Only RFC1918/ULA addresses participate in site inventory detection."""
+
+    if not any(source_ip in network for network in _INTERNAL_NETWORKS
+               if network.version == source_ip.version):
+        return False
+    return not any(source_ip in ipaddress.ip_network(cidr, strict=False)
+                   for cidr in known_devices)
+
+
+def _new_quarantine_generation(site_id: int, source_ip: str) -> object:
+    generation = object()
+    with _FIREWALL_LOCK:
+        _QUARANTINE_GENERATIONS[(site_id, source_ip)] = generation
+    return generation
 
 # Métricas de observabilidad expuestas a Prometheus.
 PROM_FLOWS = Counter(
@@ -142,6 +181,7 @@ class NetworkFlow(BaseModel):
     destination_ip: IPvAnyAddress
     destination_port: int = Field(ge=0, le=65535)
     features: list[Any] | dict[str, Any]
+    link_degraded: bool | None = None
 
 
 class IngestResponse(BaseModel):
@@ -149,6 +189,79 @@ class IngestResponse(BaseModel):
     anomaly: bool
     message: str
     dashboard_state_persisted: bool | None = None
+    unrecognized_device: bool = False
+    mitigation_applied: bool = False
+    response_suspended: bool = False
+
+
+class AlertView(BaseModel):
+    id: int
+    site_id: int
+    sensor_id: int
+    source_ip: str
+    destination_ip: str
+    destination_port: int
+    mse_score: float
+    severity: Literal["warning", "high", "critical"]
+    anomaly: bool
+    unrecognized_device: bool
+    link_degraded: bool
+    informative_only_mode: bool
+    mitigation_applied: bool
+    occurred_at: datetime
+
+
+class SensorTelemetryView(BaseModel):
+    sensor_id: int
+    site_id: int
+    is_active: bool
+    last_heartbeat_at: datetime | None
+    last_ingest_at: datetime | None
+    flow_count: int
+    last_link_degraded: bool
+    last_link_report_at: datetime | None
+
+
+class HeartbeatPayload(BaseModel):
+    link_degraded: bool = False
+
+
+class SiteConfigView(BaseModel):
+    site_id: int
+    custom_mse_threshold: float | None
+    active_response_enabled: bool
+    informative_only_mode: bool
+    known_devices: list[str]
+
+
+class SiteConfigUpdate(BaseModel):
+    custom_mse_threshold: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    active_response_enabled: bool | None = None
+    informative_only_mode: bool | None = None
+    known_devices: list[str] | None = Field(default=None, max_length=512)
+
+    @field_validator("known_devices")
+    @classmethod
+    def canonical_known_devices(cls, values: list[str] | None) -> list[str] | None:
+        if values is None:
+            return None
+        canonical = []
+        for value in values:
+            try:
+                network = ipaddress.ip_network(value.strip(), strict=False)
+            except (ValueError, AttributeError) as exc:
+                raise ValueError(f"invalid device IP or CIDR: {value!r}") from exc
+            name = str(network)
+            if name not in canonical:
+                canonical.append(name)
+        return canonical
+
+
+class ManualReversionResponse(BaseModel):
+    site_id: int
+    source_ip: str
+    reverted: bool
+    rule_was_present: bool
 
 
 class HealthResponse(BaseModel):
@@ -248,6 +361,7 @@ async def lifespan(app: FastAPI):
         app.state.database_ready = True
         logger.info("PostgreSQL schema is ready")
         for quarantine in list_quarantines_for_recovery():
+            generation = _new_quarantine_generation(quarantine.site_id, quarantine.source_ip)
             remaining = max(
                 0,
                 int((quarantine.expires_at - datetime.now(timezone.utc)).total_seconds()),
@@ -258,10 +372,15 @@ async def lifespan(app: FastAPI):
                     quarantine.source_ip,
                     remaining,
                     quarantine.mse_score,
+                    quarantine.applied_event_id,
+                    generation,
                 )
             )
             app.state.release_tasks.add(task)
             task.add_done_callback(app.state.release_tasks.discard)
+    except RuntimeError:
+        logger.exception("Database schema is incompatible; run the required migration")
+        raise
     except Exception:
         # Las solicitudes posteriores pueden funcionar si PostgreSQL se recupera.
         logger.exception("Database initialization failed; API is running in degraded mode")
@@ -458,83 +577,115 @@ def _quarantine_source_ip(source_ip: IPvAnyAddress) -> tuple[bool, bool]:
     return True, True
 
 
+def _restore_quarantine_rule_locked(source_ip: str) -> None:
+    """Compensate a failed DB release while the local firewall lock is held."""
+
+    firewall = ["sudo", "-n", "iptables", "-w", "2"]
+    rule = ["INPUT", "-s", source_ip, "-j", "DROP"]
+    check = subprocess.run([*firewall, "-C", *rule], check=False,
+                           capture_output=True, text=True, timeout=5)
+    if check.returncode == 0:
+        return
+    if check.returncode != 1 or not any(
+        marker in (check.stderr or "").lower()
+        for marker in ("bad rule", "matching rule")
+    ):
+        raise subprocess.CalledProcessError(check.returncode, check.args,
+                                            stderr=check.stderr)
+    subprocess.run([*firewall, "-I", "INPUT", "1", "-s", source_ip, "-j", "DROP"],
+                   check=True, capture_output=True, text=True, timeout=5)
+
+
+def _rollback_unpersisted_firewall_rule_locked(source_ip: str) -> None:
+    """Remove a newly inserted rule when its APPLY transaction did not commit."""
+
+    firewall = ["sudo", "-n", "iptables", "-w", "2"]
+    rule = ["INPUT", "-s", source_ip, "-j", "DROP"]
+    subprocess.run([*firewall, "-D", *rule], check=True,
+                   capture_output=True, text=True, timeout=5)
+
+
 async def _remove_quarantine(
     site_id: int,
     source_ip: str,
     delay: int = 60,
     mse_score: float | None = None,
+    expected_event_id: int | None = None,
+    generation: object | None = None,
 ) -> None:
-    """Remove a firewall rule and its live DB state after a delay."""
-    await asyncio.sleep(delay)
+    """Release at TTL; restore the rule and retry if the DB commit fails."""
 
     firewall = ["sudo", "-n", "iptables", "-w", "2"]
     rule = ["INPUT", "-s", source_ip, "-j", "DROP"]
-
-    try:
-        with _FIREWALL_LOCK:
-            current_rule = subprocess.run(
-                [*firewall, "-C", *rule],
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            if current_rule.returncode == 0:
-                subprocess.run(
-                    [*firewall, "-D", *rule],
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                    timeout=5,
-                )
-            elif current_rule.returncode != 1 or not any(
-                marker in (current_rule.stderr or "").lower()
-                for marker in ("bad rule", "matching rule")
-            ):
-                raise subprocess.CalledProcessError(
-                    current_rule.returncode,
-                    current_rule.args,
-                    stderr=current_rule.stderr,
-                )
-
+    while True:
+        await asyncio.sleep(delay)
         try:
-            release_quarantine_state(site_id, source_ip)
-        except SQLAlchemyError:
-            logger.exception(
-                "Firewall released %s for site %s, but its DB state could not be cleared",
-                source_ip,
-                site_id,
-            )
-
-        if current_rule.returncode == 0:
-            logger.warning(
-                "[~] Cuarentena levantada para %s tras %s segundos",
-                source_ip,
-                delay,
-            )
-            if mse_score is not None:
-                _send_telegram_alert(source_ip, mse_score, False)
-        else:
-            logger.info("Firewall rule for %s was already absent", source_ip)
-
-        if app.state.audit_log is not None:
-            try:
-                app.state.audit_log.log_detection(
-                    action="quarantine_released",
-                    site_id=site_id,
-                    source_ip=source_ip,
-                    rule_was_present=current_rule.returncode == 0,
+            retry = False
+            with _FIREWALL_LOCK:
+                if (generation is not None and
+                        _QUARANTINE_GENERATIONS.get((site_id, source_ip)) is not generation):
+                    return
+                if expected_event_id is not None:
+                    rows = find_active_quarantines(source_ip, site_id)
+                    if not rows or rows[0].applied_event_id != expected_event_id:
+                        return
+                current_rule = subprocess.run(
+                    [*firewall, "-C", *rule], check=False,
+                    capture_output=True, text=True, timeout=5,
                 )
-            except Exception:
-                logger.exception("Could not write quarantine release to the local audit log")
-    except subprocess.CalledProcessError as exc:
-        logger.error(
-            "[-] Error al levantar cuarentena de %s: %s",
-            source_ip,
-            (exc.stderr or "").strip(),
-        )
-    except Exception as exc:
-        logger.error("[-] Fallo inesperado al borrar regla de %s: %s", source_ip, exc)
+                rule_removed = current_rule.returncode == 0
+                if rule_removed:
+                    subprocess.run([*firewall, "-D", *rule], check=True,
+                                   capture_output=True, text=True, timeout=5)
+                elif current_rule.returncode != 1 or not any(
+                    marker in (current_rule.stderr or "").lower()
+                    for marker in ("bad rule", "matching rule")
+                ):
+                    raise subprocess.CalledProcessError(
+                        current_rule.returncode, current_rule.args,
+                        stderr=current_rule.stderr,
+                    )
+                try:
+                    released = release_quarantine_state(
+                        site_id, source_ip, expected_event_id=expected_event_id
+                    )
+                except SQLAlchemyError:
+                    logger.exception("DB release failed for %s; restoring firewall rule", source_ip)
+                    if rule_removed:
+                        _restore_quarantine_rule_locked(source_ip)
+                    retry = True
+                else:
+                    if not released and rule_removed:
+                        # Another worker may have replaced the projection. Keep
+                        # its firewall protection if any live row still owns it.
+                        if find_active_quarantines(source_ip):
+                            _restore_quarantine_rule_locked(source_ip)
+                    if generation is not None:
+                        _QUARANTINE_GENERATIONS.pop((site_id, source_ip), None)
+            if retry:
+                delay = 30
+                continue
+            if rule_removed:
+                logger.warning("[~] Cuarentena levantada para %s", source_ip)
+                if mse_score is not None:
+                    _send_telegram_alert(source_ip, mse_score, False)
+            else:
+                logger.info("Firewall rule for %s was already absent", source_ip)
+            if getattr(app.state, "audit_log", None) is not None:
+                try:
+                    app.state.audit_log.log_detection(
+                        action="quarantine_released", site_id=site_id,
+                        source_ip=source_ip, rule_was_present=rule_removed,
+                    )
+                except Exception:
+                    logger.exception("Could not write quarantine release to the local audit log")
+            return
+        except SQLAlchemyError:
+            logger.exception("DB lookup failed during quarantine release for %s; retrying", source_ip)
+            delay = 30
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+            logger.exception("Firewall release or restoration failed for %s", source_ip)
+            return
 
 
 def _send_telegram_alert(
@@ -590,14 +741,81 @@ def _send_telegram_alert(
 
 
 async def _notify_and_release_quarantine(
-    site_id: int, source_ip: str, mse_score: float
+    site_id: int, source_ip: str, mse_score: float,
+    expected_event_id: int | None = None, generation: object | None = None,
 ) -> None:
     """Start the timer and Telegram delivery together after the HTTP response."""
 
     await asyncio.gather(
         asyncio.to_thread(_send_telegram_alert, source_ip, mse_score, True),
-        _remove_quarantine(site_id, source_ip, QUARANTINE_SECONDS, mse_score),
+        _remove_quarantine(
+            site_id, source_ip, QUARANTINE_SECONDS, mse_score,
+            expected_event_id, generation,
+        ),
     )
+
+
+def _record_alert_and_response(
+    *, sensor: SensorIdentity, flow: NetworkFlow, mse_score: float,
+    anomaly: bool, critical: bool, severity: str, unrecognized_device: bool,
+    link_degraded: bool, response_suspended: bool,
+) -> tuple[bool, bool, bool, int | None, object | None]:
+    """Serialize firewall insertion and its APPLY event within one API worker."""
+
+    mitigation_applied = False
+    is_new = False
+    applied_event_id = None
+    generation = None
+    active_response = anomaly and sensor.active_response_enabled and not response_suspended
+    guard = _FIREWALL_LOCK if active_response else nullcontext()
+    with guard:
+        if active_response:
+            mitigation_applied, is_new = _quarantine_source_ip(flow.source_ip)
+        write_critical_snapshot = critical and _reserve_critical_snapshot(
+            sensor.site_id, str(flow.source_ip)
+        )
+        try:
+            applied_event_id = record_detection_state(
+                site_id=sensor.site_id,
+                sensor_id=sensor.sensor_id,
+                source_ip=str(flow.source_ip),
+                destination_ip=str(flow.destination_ip),
+                destination_port=flow.destination_port,
+                mse_score=mse_score,
+                newly_quarantined=is_new,
+                critical=write_critical_snapshot,
+                quarantine_seconds=QUARANTINE_SECONDS,
+                alert_ttl_hours=ALERT_TTL_HOURS,
+                alert_update_seconds=ALERT_UPDATE_SECONDS,
+                severity=severity,
+                anomaly=anomaly,
+                unrecognized_device=unrecognized_device,
+                link_degraded=link_degraded,
+                informative_only_mode=sensor.informative_only_mode,
+                mitigation_applied=mitigation_applied,
+            )
+            persisted = True
+        except SQLAlchemyError:
+            if write_critical_snapshot:
+                _forget_critical_snapshot(sensor.site_id, str(flow.source_ip))
+            persisted = False
+            logger.exception("Could not update the PostgreSQL alert and dashboard state")
+            if is_new:
+                try:
+                    _rollback_unpersisted_firewall_rule_locked(str(flow.source_ip))
+                except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+                    logger.critical(
+                        "Could not remove unrecorded firewall rule for %s; TTL fallback scheduled",
+                        flow.source_ip, exc_info=True,
+                    )
+                else:
+                    mitigation_applied = False
+                    is_new = False
+        if is_new:
+            # Register the timer generation before another request can revert
+            # or reapply this same source IP in this worker.
+            generation = _new_quarantine_generation(sensor.site_id, str(flow.source_ip))
+    return mitigation_applied, is_new, persisted, applied_event_id, generation
 
 
 @app.get("/health", response_model=HealthResponse, tags=["operations"])
@@ -655,6 +873,208 @@ def dashboard_state(
     )
 
 
+@app.get("/alerts", response_model=list[AlertView], tags=["operations"])
+def get_alerts(
+    principal: Annotated[AdminIdentity | SensorIdentity, Depends(get_authenticated_reader)],
+    site_id: int | None = Query(default=None, gt=0),
+    sensor_id: int | None = Query(default=None, gt=0),
+    source_ip: IPvAnyAddress | None = None,
+    severity: Literal["warning", "high", "critical"] | None = None,
+    limit: int = Query(default=100, ge=1, le=1000),
+) -> list[AlertView]:
+    """List recent alerts; a sensor may read only its own site's alerts."""
+
+    if isinstance(principal, SensorIdentity):
+        if site_id is not None and site_id != principal.site_id:
+            raise HTTPException(status_code=403, detail="Cross-site alert access is forbidden")
+        site_id = principal.site_id
+    try:
+        rows = list_alerts(site_id=site_id, sensor_id=sensor_id,
+                           source_ip=str(source_ip) if source_ip is not None else None,
+                           severity=severity, limit=limit)
+    except SQLAlchemyError as exc:
+        raise HTTPException(status_code=503, detail="Alert database is unavailable") from exc
+    return [AlertView.model_validate(row, from_attributes=True) for row in rows]
+
+
+@app.get("/sensors/{sensor_id}/telemetry", response_model=SensorTelemetryView,
+         tags=["operations"])
+def sensor_telemetry(
+    sensor_id: int,
+    principal: Annotated[AdminIdentity | SensorIdentity, Depends(get_authenticated_reader)],
+) -> SensorTelemetryView:
+    if isinstance(principal, SensorIdentity) and principal.sensor_id != sensor_id:
+        raise HTTPException(status_code=403, detail="Other sensor telemetry is forbidden")
+    try:
+        result = get_sensor_telemetry(sensor_id)
+    except SQLAlchemyError as exc:
+        raise HTTPException(status_code=503, detail="Telemetry database is unavailable") from exc
+    if result is None:
+        raise HTTPException(status_code=404, detail="Sensor not found")
+    sensor, telemetry = result
+    return SensorTelemetryView(
+        sensor_id=sensor.id, site_id=sensor.site_id, is_active=sensor.is_active,
+        last_heartbeat_at=telemetry.last_heartbeat_at if telemetry else None,
+        last_ingest_at=telemetry.last_ingest_at if telemetry else None,
+        flow_count=telemetry.flow_count if telemetry else 0,
+        last_link_degraded=telemetry.last_link_degraded if telemetry else False,
+        last_link_report_at=telemetry.last_link_report_at if telemetry else None,
+    )
+
+
+@app.post("/sensors/{sensor_id}/heartbeat", response_model=SensorTelemetryView,
+          tags=["operations"])
+def sensor_heartbeat(
+    sensor_id: int,
+    payload: HeartbeatPayload,
+    sensor: Annotated[SensorIdentity, Depends(get_authenticated_sensor)],
+) -> SensorTelemetryView:
+    if sensor.sensor_id != sensor_id:
+        raise HTTPException(status_code=403, detail="Other sensor heartbeat is forbidden")
+    try:
+        update_sensor_telemetry(sensor_id, link_degraded=payload.link_degraded, ingest=False)
+        result = get_sensor_telemetry(sensor_id)
+    except SQLAlchemyError as exc:
+        raise HTTPException(status_code=503, detail="Telemetry database is unavailable") from exc
+    if result is None:
+        raise HTTPException(status_code=404, detail="Sensor not found")
+    row, telemetry = result
+    return SensorTelemetryView(
+        sensor_id=row.id, site_id=row.site_id, is_active=row.is_active,
+        last_heartbeat_at=telemetry.last_heartbeat_at,
+        last_ingest_at=telemetry.last_ingest_at,
+        flow_count=telemetry.flow_count,
+        last_link_degraded=telemetry.last_link_degraded,
+        last_link_report_at=telemetry.last_link_report_at,
+    )
+
+
+def _config_view(site_id: int, config: Any) -> SiteConfigView:
+    return SiteConfigView(
+        site_id=site_id,
+        custom_mse_threshold=config.custom_mse_threshold if config else None,
+        active_response_enabled=bool(config.active_response_enabled) if config else False,
+        informative_only_mode=bool(config.informative_only_mode) if config else True,
+        known_devices=list(config.known_devices or ()) if config else [],
+    )
+
+
+@app.get("/sites/{site_id}/config", response_model=SiteConfigView, tags=["operations"])
+def site_config(
+    site_id: int,
+    principal: Annotated[AdminIdentity | SensorIdentity, Depends(get_authenticated_reader)],
+) -> SiteConfigView:
+    if isinstance(principal, SensorIdentity) and principal.site_id != site_id:
+        raise HTTPException(status_code=403, detail="Cross-site configuration access is forbidden")
+    try:
+        result = get_site_config(site_id)
+    except SQLAlchemyError as exc:
+        raise HTTPException(status_code=503, detail="Site configuration database is unavailable") from exc
+    if result is None:
+        raise HTTPException(status_code=404, detail="Site not found")
+    return _config_view(site_id, result[1])
+
+
+@app.put("/sites/{site_id}/config", response_model=SiteConfigView, tags=["operations"])
+def put_site_config(
+    site_id: int,
+    payload: SiteConfigUpdate,
+    _admin: Annotated[AdminIdentity, Depends(get_authenticated_admin)],
+) -> SiteConfigView:
+    changes = payload.model_dump(exclude_unset=True)
+    if not changes:
+        raise HTTPException(status_code=422, detail="At least one setting is required")
+    for key in ("active_response_enabled", "informative_only_mode", "known_devices"):
+        if key in changes and changes[key] is None:
+            raise HTTPException(status_code=422, detail=f"{key} cannot be null")
+    try:
+        result = update_site_config(site_id, changes)
+    except SQLAlchemyError as exc:
+        raise HTTPException(status_code=503, detail="Site configuration database is unavailable") from exc
+    if result is None:
+        raise HTTPException(status_code=404, detail="Site not found")
+    return _config_view(site_id, result[1])
+
+
+@app.post("/quarantines/{source_ip}/revert", response_model=ManualReversionResponse,
+          tags=["operations"])
+def manual_revert_quarantine(
+    source_ip: IPvAnyAddress,
+    _admin: Annotated[AdminIdentity, Depends(get_authenticated_admin)],
+    site_id: int | None = Query(default=None, gt=0),
+    request: Request = None,
+) -> ManualReversionResponse:
+    """Remove one owned firewall rule and append an immutable manual event."""
+
+    source = str(source_ip)
+    firewall = ["sudo", "-n", "iptables", "-w", "2"]
+    rule = ["INPUT", "-s", source, "-j", "DROP"]
+    with _FIREWALL_LOCK:
+        try:
+            rows = find_active_quarantines(source, site_id)
+            all_rows = rows if site_id is None else find_active_quarantines(source)
+        except SQLAlchemyError as exc:
+            raise HTTPException(status_code=503, detail="Quarantine database is unavailable") from exc
+        if not rows:
+            raise HTTPException(status_code=404, detail="Active quarantine not found")
+        if len(all_rows) != 1:
+            raise HTTPException(status_code=409, detail="Source IP is quarantined at multiple sites")
+        row = rows[0]
+        try:
+            check = subprocess.run([*firewall, "-C", *rule], check=False,
+                                   capture_output=True, text=True, timeout=5)
+            if check.returncode == 0:
+                subprocess.run([*firewall, "-D", *rule], check=True,
+                               capture_output=True, text=True, timeout=5)
+            elif check.returncode != 1 or not any(
+                marker in (check.stderr or "").lower()
+                for marker in ("bad rule", "matching rule")
+            ):
+                raise subprocess.CalledProcessError(check.returncode, check.args,
+                                                    stderr=check.stderr)
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+            logger.exception("Manual firewall reversion failed for %s", source)
+            raise HTTPException(status_code=503, detail="Firewall reversion failed") from exc
+        try:
+            reverted = release_quarantine_state(
+                row.site_id, source, manual=True,
+                expected_event_id=row.applied_event_id,
+            )
+        except SQLAlchemyError as exc:
+            logger.exception("Manual audit event failed for %s; restoring firewall rule", source)
+            if check.returncode == 0:
+                try:
+                    _restore_quarantine_rule_locked(source)
+                except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+                    logger.critical("Could not restore firewall rule after DB failure for %s", source,
+                                    exc_info=True)
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Audit database failed and firewall restoration failed",
+                    ) from exc
+            raise HTTPException(status_code=503, detail="Audit database is unavailable; firewall rule restored") from exc
+        if not reverted:
+            if check.returncode == 0:
+                try:
+                    if find_active_quarantines(source):
+                        _restore_quarantine_rule_locked(source)
+                except (SQLAlchemyError, subprocess.CalledProcessError,
+                        subprocess.TimeoutExpired, OSError):
+                    logger.critical("Could not reconcile firewall after a racing reversion", exc_info=True)
+            raise HTTPException(status_code=409, detail="Quarantine changed during reversion")
+        _QUARANTINE_GENERATIONS.pop((row.site_id, source), None)
+    if request is not None and request.app.state.audit_log is not None:
+        try:
+            request.app.state.audit_log.log_detection(
+                action="manual_reversion", site_id=row.site_id, source_ip=source,
+                rule_was_present=check.returncode == 0,
+            )
+        except Exception:
+            logger.exception("Could not write the local manual reversion log")
+    return ManualReversionResponse(site_id=row.site_id, source_ip=source,
+                                   reverted=True, rule_was_present=check.returncode == 0)
+
+
 @app.post(
     "/ingest",
     response_model=IngestResponse,
@@ -708,6 +1128,29 @@ def ingest(
     critical = mse_score >= critical_threshold
     source_ip = str(flow.source_ip)
     destination_ip = str(flow.destination_ip)
+    unrecognized_device = _is_unrecognized_device(flow.source_ip, sensor.known_devices)
+    latest_report = sensor.last_link_report_at
+    if latest_report is not None and latest_report.tzinfo is None:
+        latest_report = latest_report.replace(tzinfo=timezone.utc)
+    recent_link_degradation = bool(
+        sensor.last_link_degraded
+        and latest_report is not None
+        and (datetime.now(timezone.utc) - latest_report).total_seconds()
+        <= LINK_STATE_TTL_SECONDS
+    )
+    link_degraded = (
+        flow.link_degraded if flow.link_degraded is not None else recent_link_degradation
+    )
+    response_suspended = link_degraded or sensor.informative_only_mode
+    severity: Literal["warning", "high", "critical"] = (
+        "critical" if critical else "high" if anomaly else "warning"
+    )
+
+    if link_degraded:
+        logger.warning(
+            "Sensor %s at site %s reported degraded connectivity; active response suspended",
+            sensor.sensor_id, sensor.site_id,
+        )
 
     try:
         audit_log.log_traffic(
@@ -722,6 +1165,11 @@ def ingest(
             mse_score=mse_score,
             anomaly=anomaly,
             critical=critical,
+            unrecognized_device=unrecognized_device,
+            link_degraded=link_degraded,
+            link_degraded_reported=flow.link_degraded,
+            informative_only_mode=sensor.informative_only_mode,
+            response_suspended=response_suspended,
         )
     except Exception as exc:
         logger.exception("Could not write flow to the local audit log")
@@ -730,8 +1178,16 @@ def ingest(
             detail="The flow was analyzed, but its local audit log could not be written",
         ) from exc
 
+    try:
+        update_sensor_telemetry(
+            sensor.sensor_id, link_degraded=flow.link_degraded, ingest=True,
+        )
+    except SQLAlchemyError:
+        logger.exception("Could not update telemetry for sensor %s", sensor.sensor_id)
+
     mitigation_applied = False
     dashboard_state_persisted: bool | None = None
+    is_new = False
     if anomaly:
         PROM_ANOMALIES.labels(site_id=str(sensor.site_id)).inc()
 
@@ -741,43 +1197,27 @@ def ingest(
             mse_score,
             source_ip,
         )
-        is_new = False
-        if sensor.active_response_enabled:
-            mitigation_applied, is_new = _quarantine_source_ip(flow.source_ip)
-        if is_new:
-            # La cuarentena temporal se libera aun si PostgreSQL falla.
-            background_tasks.add_task(
-                _notify_and_release_quarantine, sensor.site_id, source_ip, mse_score
-            )
 
-        write_critical_snapshot = critical and _reserve_critical_snapshot(
-            sensor.site_id, source_ip
+    alert_required = anomaly or unrecognized_device or link_degraded
+    if alert_required:
+        (mitigation_applied, is_new, dashboard_state_persisted,
+         applied_event_id, generation) = _record_alert_and_response(
+            sensor=sensor, flow=flow, mse_score=mse_score, anomaly=anomaly,
+            critical=critical, severity=severity,
+            unrecognized_device=unrecognized_device,
+            link_degraded=link_degraded, response_suspended=response_suspended,
         )
-        if is_new or write_critical_snapshot:
-            try:
-                record_detection_state(
-                    site_id=sensor.site_id,
-                    sensor_id=sensor.sensor_id,
-                    source_ip=source_ip,
-                    destination_ip=destination_ip,
-                    destination_port=flow.destination_port,
-                    mse_score=mse_score,
-                    newly_quarantined=is_new,
-                    critical=write_critical_snapshot,
-                    quarantine_seconds=QUARANTINE_SECONDS,
-                    alert_ttl_hours=ALERT_TTL_HOURS,
-                    alert_update_seconds=ALERT_UPDATE_SECONDS,
-                )
-                dashboard_state_persisted = True
-            except SQLAlchemyError:
-                if write_critical_snapshot:
-                    _forget_critical_snapshot(sensor.site_id, source_ip)
-                dashboard_state_persisted = False
-                logger.exception("Could not update the PostgreSQL dashboard state")
-
+        if is_new:
+            # A generation token prevents a stale timer from deleting a later
+            # quarantine. It also provides fallback after rollback failure.
+            background_tasks.add_task(
+                _notify_and_release_quarantine, sensor.site_id, source_ip,
+                mse_score, applied_event_id, generation,
+            )
         try:
             audit_log.log_detection(
-                action="anomaly_detected",
+                action=("anomaly_detected" if anomaly else
+                        "unrecognized_device" if unrecognized_device else "link_degraded"),
                 site_id=sensor.site_id,
                 site_slug=sensor.site_slug,
                 sensor_id=sensor.sensor_id,
@@ -790,6 +1230,11 @@ def ingest(
                 critical=critical,
                 critical_threshold=critical_threshold,
                 active_response_enabled=sensor.active_response_enabled,
+                informative_only_mode=sensor.informative_only_mode,
+                link_degraded=link_degraded,
+                response_suspended=response_suspended,
+                unrecognized_device=unrecognized_device,
+                severity=severity,
                 mitigation_applied=mitigation_applied,
                 quarantine_new=is_new,
                 dashboard_state_persisted=dashboard_state_persisted,
@@ -801,10 +1246,18 @@ def ingest(
                 detail="The anomaly was handled, but its local audit log could not be written",
             ) from exc
 
-    if not anomaly:
+    if not anomaly and unrecognized_device:
+        response_message = "Unrecognized internal device recorded"
+    elif not anomaly and link_degraded:
+        response_message = "Flow analyzed; degraded connectivity warning recorded"
+    elif not anomaly:
         response_message = "Flow analyzed successfully; no anomaly detected"
     elif mitigation_applied:
         response_message = "Anomaly recorded locally and source IP quarantined"
+    elif link_degraded:
+        response_message = "Anomaly recorded locally; active response suspended for degraded link"
+    elif sensor.informative_only_mode:
+        response_message = "Anomaly recorded locally; site is in informative-only mode"
     elif not sensor.active_response_enabled:
         response_message = "Anomaly recorded locally; active response is disabled for this site"
     else:
@@ -818,4 +1271,7 @@ def ingest(
         anomaly=anomaly,
         message=response_message,
         dashboard_state_persisted=dashboard_state_persisted,
+        unrecognized_device=unrecognized_device,
+        mitigation_applied=mitigation_applied,
+        response_suspended=response_suspended,
     )

@@ -1,6 +1,7 @@
 # Los datasets y las capturas se descargan o generan localmente.
 **/data/
 *.csv
+!docs/benchmark_rnf_results.csv
 *.pcap
 
 # Entornos virtuales

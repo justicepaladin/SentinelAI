@@ -18,6 +18,7 @@ from sqlalchemy import (
     ForeignKeyConstraint,
     Index,
     Integer,
+    JSON,
     String,
     UniqueConstraint,
     func,
@@ -98,6 +99,14 @@ class SiteConfig(Base):
     active_response_enabled: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default="false"
     )
+    informative_only_mode: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default="true"
+    )
+    # Canonical IPv4/IPv6 CIDR strings. An empty inventory intentionally marks
+    # every RFC1918/ULA source as unrecognized until the site is configured.
+    known_devices: Mapped[list[str]] = mapped_column(
+        JSON, nullable=False, default=list, server_default="[]"
+    )
 
     site: Mapped[Site] = relationship(back_populates="config")
 
@@ -114,12 +123,13 @@ class MitigationEvent(Base):
             ondelete="RESTRICT",
         ),
         CheckConstraint(
-            "event_type IN ('APPLY', 'REVERSION')",
+            "event_type IN ('APPLY', 'REVERSION', 'MANUAL_REVERSION')",
             name="ck_mitigation_events_event_type",
         ),
         CheckConstraint(
             "(event_type = 'APPLY' AND original_event_id IS NULL) OR "
-            "(event_type = 'REVERSION' AND original_event_id IS NOT NULL)",
+            "(event_type IN ('REVERSION', 'MANUAL_REVERSION') "
+            "AND original_event_id IS NOT NULL)",
             name="ck_mitigation_events_original_required",
         ),
         CheckConstraint(
@@ -201,3 +211,48 @@ class CriticalAlert(Base):
     first_seen: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     last_seen: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+
+
+class DetectionAlert(Base):
+    """One durable alert per anomalous flow or operational/device warning."""
+
+    __tablename__ = "detection_alerts"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["site_id", "sensor_id"], ["sensors.site_id", "sensors.id"],
+            name="fk_detection_alerts_sensor_site", ondelete="RESTRICT",
+        ),
+        CheckConstraint("severity IN ('warning', 'high', 'critical')", name="ck_detection_alerts_severity"),
+        CheckConstraint("destination_port BETWEEN 0 AND 65535", name="ck_detection_alerts_port"),
+        Index("ix_detection_alerts_site_occurred", "site_id", "occurred_at"),
+        Index("ix_detection_alerts_site_source", "site_id", "source_ip"),
+        Index("ix_detection_alerts_sensor_occurred", "sensor_id", "occurred_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    site_id: Mapped[int] = mapped_column(ForeignKey("sites.id", ondelete="RESTRICT"), nullable=False)
+    sensor_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    source_ip: Mapped[str] = mapped_column(String(45), nullable=False)
+    destination_ip: Mapped[str] = mapped_column(String(45), nullable=False)
+    destination_port: Mapped[int] = mapped_column(Integer, nullable=False)
+    mse_score: Mapped[float] = mapped_column(Float, nullable=False)
+    severity: Mapped[str] = mapped_column(String(16), nullable=False)
+    anomaly: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    unrecognized_device: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    link_degraded: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    informative_only_mode: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    mitigation_applied: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_utc_now)
+
+
+class SensorTelemetry(Base):
+    """Small operational counter and heartbeat projection for each sensor."""
+
+    __tablename__ = "sensor_telemetry"
+
+    sensor_id: Mapped[int] = mapped_column(ForeignKey("sensors.id", ondelete="RESTRICT"), primary_key=True)
+    last_heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_ingest_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_link_report_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    flow_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    last_link_degraded: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")

@@ -85,6 +85,7 @@ def flow_payload(flow: Mapping[str, Any]) -> dict[str, Any]:
         # El backend alinea por nombre las columnas numéricas del scaler.
         excluded = {
             "label", "source_ip", "destination_ip", "destination_port",
+            "link_degraded",
             "src ip", "source ip", "dst ip", "destination ip",
         }
         features = {
@@ -93,12 +94,17 @@ def flow_payload(flow: Mapping[str, Any]) -> dict[str, Any]:
             if str(name).strip().casefold() not in excluded
         }
 
-    return {
+    payload = {
         "source_ip": str(source_ip),
         "destination_ip": str(destination_ip),
         "destination_port": int(destination_port),
         "features": _native_json(features),
     }
+    if "link_degraded" in flow:
+        if type(flow["link_degraded"]) is not bool:
+            raise ValueError("link_degraded debe ser booleano")
+        payload["link_degraded"] = flow["link_degraded"]
+    return payload
 
 
 def send_flows(

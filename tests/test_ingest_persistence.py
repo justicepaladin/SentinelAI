@@ -36,6 +36,9 @@ class IngestPersistenceTests(unittest.TestCase):
         main.app.state.scaler = object()
         main.app.state.audit_log = MemoryAuditLog()
         main._CRITICAL_WRITE_CACHE.clear()
+        self.telemetry_patch = patch.object(main, "update_sensor_telemetry")
+        self.telemetry_patch.start()
+        self.addCleanup(self.telemetry_patch.stop)
         self.flow = main.NetworkFlow(
             source_ip="192.0.2.25",
             destination_ip="198.51.100.8",
@@ -90,11 +93,15 @@ class IngestPersistenceTests(unittest.TestCase):
             main, "_quarantine_source_ip", return_value=(True, True)
         ), patch.object(
             main, "record_detection_state", side_effect=SQLAlchemyError("offline")
-        ):
-            result = main.ingest(self.flow, self.request, BackgroundTasks(), self.sensor)
+        ), patch.object(main, "_rollback_unpersisted_firewall_rule_locked") as rollback:
+            background = BackgroundTasks()
+            result = main.ingest(self.flow, self.request, background, self.sensor)
 
         self.assertTrue(result.anomaly)
         self.assertFalse(result.dashboard_state_persisted)
+        self.assertFalse(result.mitigation_applied)
+        self.assertEqual(len(background.tasks), 0)
+        rollback.assert_called_once_with("192.0.2.25")
         self.assertEqual(len(main.app.state.audit_log.traffic), 1)
         self.assertEqual(len(main.app.state.audit_log.detections), 1)
         self.assertFalse(

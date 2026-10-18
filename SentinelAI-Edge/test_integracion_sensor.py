@@ -83,6 +83,16 @@ class EdgePipelineTests(unittest.TestCase):
                     captured_flows(), session=FakeSession(), api_url="https://example.test/ingest"
                 )
 
+    def test_link_health_is_metadata_not_a_model_feature(self):
+        payload = edge.flow_payload({
+            "Src IP": "10.0.0.8", "Dst IP": "10.0.0.9", "Dst Port": 443,
+            "Flow Duration": 15, "link_degraded": True,
+        })
+        self.assertTrue(payload["link_degraded"])
+        self.assertNotIn("link_degraded", payload["features"])
+        with self.assertRaisesRegex(ValueError, "link_degraded"):
+            edge.flow_payload({"features": [1.0], "link_degraded": "true"})
+
     def test_csv_replay_reads_source_once_in_chunks(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             source = Path(temp_dir) / "flows.csv"

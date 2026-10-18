@@ -1,8 +1,8 @@
 # SentinelAI: arquitectura, operación y validación
 
-Documento de referencia para continuar el proyecto después de la entrega del 50 %. Describe el código de esta rama, los artefactos que necesita y la forma de comprobar los cambios de persistencia y validación del modelo. Los ejemplos parten de la raíz del repositorio.
+Documento de referencia del trabajo del 50 % y su avance del 75 %. Los ejemplos parten de la raíz del repositorio.
 
-La rama `new-fix-50` continúa el trabajo de `fix-50%` y reúne la demo con notificaciones de Telegram y `demo50lv2`, que aportó el laboratorio de contenedores cliente/víctima.
+La rama `75` parte de `new-fix-50`, que reunió la demo con notificaciones de Telegram y `demo50lv2`.
 
 ## 1. Qué hace el proyecto
 
@@ -14,8 +14,8 @@ Extractor o CSV → Edge con token → POST /ingest → autenticar sensor y siti
                                               → scaler y autoencoder compartidos
                                               → MSE > umbral del sitio
                                               ├─ registro local rotativo
-                                              ├─ estado y eventos por sitio en PostgreSQL
-                                              └─ respuesta activa habilitada → iptables/Telegram
+                                              ├─ alertas, telemetría y eventos en PostgreSQL
+                                              └─ respuesta activa + modo no informativo + enlace sano → iptables/Telegram
 ```
 
 El replay usa datos ya procesados de CIC-IDS2017. No captura paquetes de red en vivo. Las direcciones IP de la demo se construyen para mostrar el bloqueo, y no provienen del CSV de características.
@@ -27,7 +27,7 @@ El replay usa datos ya procesados de CIC-IDS2017. No captura paquetes de red en 
 | `SentinelAI-Backend/main.py` | API, preparación de características, inferencia, métricas, mitigación y Telegram. |
 | `SentinelAI-Backend/database.py` | Conexión SQLAlchemy y tablas de estado operacional. |
 | `SentinelAI-Backend/models.py` | Esquema de sitios, sensores, configuración, proyecciones y eventos de mitigación. |
-| `SentinelAI-Backend/auth.py` | Resolución del sensor autenticado mediante token Bearer. |
+| `SentinelAI-Backend/auth.py` | Autenticación separada de sensores y administrador mediante Bearer. |
 | `SentinelAI-Backend/provision_sensor.py` | Registro de sitio/sensor y emisión de un token para el Edge. |
 | `SentinelAI-Backend/state_store.py` | Escrituras y consultas acotadas del estado actual por sitio e IP. |
 | `SentinelAI-Backend/traffic_logging.py` | Registro de flujos y detecciones en archivos `.log` locales con rotación. |
@@ -37,6 +37,9 @@ El replay usa datos ya procesados de CIC-IDS2017. No captura paquetes de red en 
 | `SentinelAI-Model/01_Exploracion_Dataset.ipynb` | Exploración, limpieza, entrenamiento y cálculo del umbral original. |
 | `SentinelAI-Model/models/` | Scaler y modelo entrenado que consume el backend. |
 | `SentinelAI-Model/evaluate_ood.py` | Evaluación por día y fuera de distribución con artefactos ya entrenados. |
+| `SentinelAI-Model/threshold_analysis.py` | Prueba de normalidad y comparación de umbrales MSE. |
+| `SentinelAI-Backend/migrate_75.py` | Migración transaccional del esquema `new-fix-50`. |
+| `scripts/benchmark_rnf.py` | Latencias y políticas RNF con el modelo real y colaboradores en memoria. |
 | `scripts/archive_logs.py` | Archivo de logs antiguos para cron. |
 | `docker-compose.yml` | Laboratorio opcional con un servidor Nginx `victima` y un contenedor Alpine `cliente`. |
 | `start_demo.sh` | Orquestación interactiva de la demo en el entorno local original. |
@@ -89,7 +92,7 @@ python provision_sensor.py \
   --threshold 0.000308
 ```
 
-El script muestra `SENTINEL_SENSOR_TOKEN=...` **una sola vez**. Guardar el valor fuera del repositorio: PostgreSQL conserva únicamente su SHA-256 y no permite recuperarlo en texto. `--threshold` define el umbral MSE de ese sitio; si se omite, se usa el valor base desplegado. La respuesta activa con `iptables` está deshabilitada por defecto y sólo se habilita para un sitio con `--active-response`. Para bases ya usadas en `fix-50%`, aplicar primero la migración descrita abajo.
+El script muestra `SENTINEL_SENSOR_TOKEN=...` **una sola vez**. Guardar el valor fuera del repositorio: PostgreSQL conserva únicamente su SHA-256 y no permite recuperarlo en texto. `--threshold` define el umbral MSE de ese sitio; si se omite, se usa el valor base desplegado. La respuesta activa está deshabilitada por defecto y el modo informativo está habilitado por defecto. Para una demo con bloqueo, usar `--active-response --disable-informative-only`. Para bases previas, aplicar las migraciones descritas abajo.
 
 Desde `SentinelAI-Backend`, con el entorno virtual activo, iniciar:
 
@@ -113,7 +116,7 @@ Pegar en la lectura silenciosa sólo el valor del token emitido, sin el prefijo 
 
 `integracion_sensor.py` separa la fuente de flujos del envío: `send_flows(flows, session=..., api_url=..., token=...)` consume cualquier iterable de diccionarios entregado por un extractor y publica cada flujo directamente desde memoria. No necesita crear un CSV intermedio. `iter_csv_flows(path, chunk_size=512)` sirve como adaptador para una demo con CSV: lee por bloques y entrega las filas en una sola pasada. Esto evita cargar el archivo completo en ese sensor; `demo_replay.py` sigue siendo una demo separada que selecciona 100 filas de un CSV.
 
-El sensor usa `SENTINEL_SENSOR_TOKEN` para enviar `Authorization: Bearer <token>`; el backend obtiene el sensor y el sitio desde ese token. El Edge no envía `site_id` como dato confiable. `SENTINEL_API_URL`, `SENTINEL_CSV_FILE`, `SENTINEL_CSV_CHUNK_SIZE` y `SENTINEL_FLOW_DELAY` controlan el replay por bloques; `SENTINEL_REPLAY_CSV_FILE` cambia el CSV de `demo_replay.py`.
+El sensor usa `SENTINEL_SENSOR_TOKEN` para enviar `Authorization: Bearer <token>`; el backend obtiene el sensor y el sitio desde ese token. El Edge no envía `site_id` como dato confiable. Puede agregar `link_degraded` al flujo cuando su monitor de enlace detecte degradación. `SENTINEL_API_URL`, `SENTINEL_CSV_FILE`, `SENTINEL_CSV_CHUNK_SIZE` y `SENTINEL_FLOW_DELAY` controlan el replay por bloques; `SENTINEL_REPLAY_CSV_FILE` cambia el CSV de `demo_replay.py`.
 
 `start_demo.sh` abre ventanas con `ptyxis`, inicia el contenedor local de PostgreSQL y usa `sudo` para la demo de `iptables`. Exige `SENTINEL_SENSOR_TOKEN` exportado antes de iniciar, pero no aprovisiona el sensor; sólo la ventana Edge hereda ese token. Al terminar la presentación deja el backend y PostgreSQL activos para que las liberaciones temporizadas puedan completarse; después hay que detener Uvicorn con `Ctrl+C` y, si corresponde, ejecutar `docker stop sentinel-postgres`. El script no vacía la cadena `INPUT` ni elimina reglas ajenas a SentinelAI. Para observar el bloqueo hace falta un sitio creado con `--active-response` y permisos `sudo -n iptables` para el proceso backend.
 
@@ -133,7 +136,11 @@ Este Compose sólo crea la red de laboratorio y una página de prueba. No arranc
 
 | Ruta | Uso |
 | --- | --- |
-| `POST /ingest` | Requiere token Bearer del sensor, recibe un flujo y responde `mse_score`, `anomaly`, `message` y `dashboard_state_persisted`. |
+| `POST /ingest` | Requiere token Bearer del sensor; responde MSE, decisión, inventario, mitigación y persistencia. Acepta `link_degraded`. |
+| `GET /alerts` | Lista alertas con filtros por sitio, sensor, IP y severidad; administración global o sensor de su propio sitio. |
+| `GET /sensors/{sensor_id}/telemetry` y `POST /sensors/{sensor_id}/heartbeat` | Consulta de estadísticas y reporte de heartbeat del propio sensor. |
+| `GET /sites/{site_id}/config` y `PUT /sites/{site_id}/config` | Consulta y actualización del umbral, modos de respuesta e IP/subredes conocidas. PUT requiere administrador. |
+| `POST /quarantines/{source_ip}/revert` | Reversión manual por administrador, con evento inmutable en PostgreSQL. |
 | `GET /health` | Informa si cargaron los artefactos ML y el logger, y si la base estaba lista al iniciar. |
 | `GET /dashboard/state` | Requiere token Bearer y devuelve sólo las cuarentenas y alertas críticas vigentes del sitio de ese sensor. |
 | `GET /metrics` | Expone contadores de flujos/anomalías y el último MSE para Prometheus. |
@@ -165,27 +172,43 @@ curl -H "Authorization: Bearer ${SENTINEL_SENSOR_TOKEN}" \
 
 La respuesta normal tiene HTTP 200. `dashboard_state_persisted` vale `true` cuando el intento de persistencia en PostgreSQL terminó sin error, `false` cuando se intentó y falló, y `null` cuando el flujo no requería una escritura. Un fallo de PostgreSQL no descarta el registro local ni la decisión del modelo; queda indicado en ese campo y en `message`. La API devuelve 422 para características inválidas, 503 si faltan artefactos ML o no se puede escribir el log local, y 500 ante un fallo interno de inferencia. `GET /dashboard/state` devuelve 503 si no puede consultar PostgreSQL. La disponibilidad de PostgreSQL se comprueba al iniciar; el campo `database_ready_at_startup` no es una prueba continua de salud.
 
+### Avance del 75 % y trazabilidad
+
+| Requisito | Componente verificable |
+| --- | --- |
+| RF-05 | `GET /alerts` filtra alertas persistentes por sitio, sensor, IP y severidad; `POST /quarantines/{source_ip}/revert` exige token administrador, elimina la regla y agrega `MANUAL_REVERSION` inmutable. |
+| RF-06 | `GET /sensors/{sensor_id}/telemetry` muestra último heartbeat, última ingesta, total de flujos y estado activo. `POST /sensors/{sensor_id}/heartbeat` registra heartbeat explícito. |
+| RF-07, RF-08, RNF-06 | `GET/PUT /sites/{site_id}/config` gestiona umbral, `active_response_enabled`, `informative_only_mode` e inventario CIDR. El modo informativo inicia activo. |
+| RNF-05 | Un flujo con `link_degraded=true` suspende `iptables`; si omite el campo, se usa un reporte explícito reciente del sensor durante 120 s por defecto. La detección y la alerta siguen activas. |
+| RF-09 | Una IP fuente RFC1918/ULA ausente del inventario genera `unrecognized_device=true` en respuesta y log, y una alerta de severidad `warning` si no había anomalía. |
+| RNF-03, RNF-05, RNF-06 | [Benchmark medido](benchmark_rnf_results.md) con 500 peticiones y [CSV](benchmark_rnf_results.csv); usa modelo y scaler reales, con firewall y persistencia simulados en memoria. |
+| Objeción estadística | [Normalidad, FPR y F1 por umbral](threshold_justification.md), medidos con los CSV locales completos. |
+
+`PUT /sites/{site_id}/config` y la reversión manual usan un token administrador separado, cuyo SHA-256 hexadecimal se guarda en `SENTINEL_ADMIN_TOKEN_SHA256` en el `.env` del backend. Las consultas de alertas y configuración aceptan ese token o el de un sensor del mismo sitio. La telemetría de un sensor sólo puede leerla el administrador o ese sensor. La [guía del backend](../SentinelAI-Backend/README.md) incluye contratos y ejemplo de configuración.
+
 ## 4. Persistencia y ciclo de vida de los logs
 
 El cambio de esta entrega separa dos necesidades:
 
 1. **Historial de tráfico y decisiones:** cada inferencia escribe un registro local en un `.log`, tanto si es normal como si es anómala. Los archivos rotan para impedir que uno solo crezca indefinidamente.
-2. **Estado y auditoría de mitigaciones:** PostgreSQL conserva las proyecciones operacionales `active_quarantines` y `critical_alerts`, además de un historial acotado a acciones de firewall en `mitigation_events`. No almacena cada flujo ni cada decisión de inferencia.
+2. **Alertas, estado y auditoría:** PostgreSQL conserva `detection_alerts` (anomalías y advertencias), `sensor_telemetry`, las proyecciones `active_quarantines` y `critical_alerts` y el historial de firewall en `mitigation_events`. No almacena cada flujo normal.
 
-Los logs locales representan la historia de tráfico y detecciones e incluyen identificadores de sitio y sensor. `active_quarantines` y `critical_alerts` se identifican por `(site_id, source_ip)`, por lo que una IP puede tener estados distintos en dos sitios. La primera guarda la cuarentena y su vencimiento; la segunda mantiene la última alerta crítica con `first_seen`, `last_seen` y vencimiento. El umbral crítico efectivo es el mayor entre `SENTINEL_CRITICAL_MSE` y tres veces el umbral MSE del sitio. Las actualizaciones de alertas se limitan temporalmente para evitar una escritura por cada inferencia. La consulta filtra filas vencidas; la limpieza física de alertas vencidas ocurre cuando llega otra crítica.
+Los logs locales representan la historia de tráfico y detecciones e incluyen identificadores de sitio y sensor. `active_quarantines` y `critical_alerts` se identifican por `(site_id, source_ip)`, por lo que una IP puede tener estados distintos en dos sitios. La primera guarda la cuarentena y su vencimiento; la segunda mantiene la última alerta crítica con `first_seen`, `last_seen` y vencimiento. El umbral crítico efectivo es el mayor entre `SENTINEL_CRITICAL_MSE` y tres veces el umbral MSE del sitio. Sólo las actualizaciones de la proyección `critical_alerts` se limitan temporalmente; `detection_alerts` registra cada anomalía o advertencia. La consulta filtra proyecciones vencidas; la limpieza física de alertas críticas vencidas ocurre cuando llega otra crítica.
 
-`mitigation_events` conserva eventos de acción `APPLY` y `REVERSION`. Cada reversión referencia el evento de aplicación original; la base exige que corresponda al mismo sitio e IP y permite una sola reversión por aplicación. Un trigger de PostgreSQL prohíbe modificar, borrar o truncar esos eventos. Así, la vista actual del dashboard puede cambiar sin reescribir la evidencia de una acción de firewall. Para reconstruir una línea temporal de todas las detecciones se consultan los `.log` y sus archivos comprimidos; los eventos SQL sólo cubren mitigaciones.
+`mitigation_events` conserva `APPLY`, `REVERSION` y `MANUAL_REVERSION`. Cada reversión referencia la aplicación original; la base exige el mismo sitio e IP y permite una sola reversión por aplicación. Un trigger de PostgreSQL prohíbe modificar, borrar o truncar esos eventos. `detection_alerts` permite consultar alertas filtradas; los `.log` conservan el detalle de todos los flujos y decisiones. Cada alerta nueva genera una fila SQL; la limitación temporal se aplica sólo a la proyección `critical_alerts`.
 
-Si PostgreSQL falla después de que `iptables` aplica una regla, la respuesta indica `dashboard_state_persisted=false` y el log local conserva el resultado, pero la acción no queda en `mitigation_events`. La conciliación posterior del firewall y el registro persistente de ese caso quedan como trabajo operativo pendiente.
+Si PostgreSQL falla al registrar `APPLY` después de insertar una regla en `iptables`, el backend elimina de inmediato esa regla y responde con `dashboard_state_persisted=false`. El log local conserva la detección y el fallo. Si también falla la eliminación, se registra un error crítico y se programa un nuevo intento al vencer el TTL; ese caso requiere revisión operativa del firewall.
 
 | Tabla | Alcance |
 | --- | --- |
 | `sites` | Identificador estable `slug`, nombre y estado activo del sitio. |
 | `sensors` | Sensor vinculado a un sitio; guarda sólo `token_hash` SHA-256 y estado activo. |
-| `site_configs` | Umbral MSE opcional y habilitación de respuesta activa por sitio; deshabilitada por defecto. |
+| `site_configs` | Umbral MSE, respuesta activa, modo informativo e inventario CIDR por sitio. |
+| `sensor_telemetry` | Última ingesta/heartbeat, contador de flujos y estado de enlace reportado. |
+| `detection_alerts` | Alertas y advertencias filtrables por sitio, sensor, origen y severidad. |
 | `active_quarantines` | Proyección actual por `(site_id, source_ip)`, enlazada al evento `APPLY` cuando existe. |
 | `critical_alerts` | Última alerta crítica vigente por `(site_id, source_ip)`. |
-| `mitigation_events` | Historial inmutable de aplicaciones y reversiones de reglas. |
+| `mitigation_events` | Historial inmutable de aplicaciones, reversiones automáticas y manuales. |
 
 La tabla heredada `alerts` puede seguir existiendo en una base iniciada con versiones anteriores. El backend nuevo no agrega filas allí; su contenido previo requiere una migración o purga manual después de hacer un respaldo. `create_all()` crea tablas faltantes, pero no convierte ni borra filas antiguas.
 
@@ -206,6 +229,8 @@ python SentinelAI-Backend/migrate_multisite.py \
 El ejemplo de `pg_dump` corresponde al contenedor local de esta guía; adaptar usuario, base y destino del respaldo a cada instalación. La migración de PostgreSQL se ejecuta en una transacción, conserva filas de `active_quarantines` y `critical_alerts`, las asigna al sitio heredado y cambia la clave a `(site_id, source_ip)`. Cada cuarentena previa recibe un evento `APPLY` importado con `sensor_id` vacío, ya que el esquema anterior no guardaba sensor. No inventa detecciones históricas. La configuración del sitio migrado deja deshabilitada la respuesta activa. Si se repite sobre un esquema ya migrado, valida su integridad y no duplica filas; rechaza esquemas parciales o inesperados.
 
 Después, ejecutar `provision_sensor.py` para registrar al menos un sensor en `legacy`, conservar el nuevo token y recién entonces iniciar la API. La tabla heredada `alerts` no se modifica; respaldarla y aplicar una política de retención antes de purgarla manualmente. `create_all()` tampoco convierte futuras revisiones del esquema: los cambios posteriores requieren migraciones nuevas.
+
+Para una base que ya usa el esquema `new-fix-50`, detener la API, respaldarla y ejecutar `python SentinelAI-Backend/migrate_75.py` con `DATABASE_URL` configurado. Si la base partió de `fix-50%`, ejecutar primero `migrate_multisite.py` y después `migrate_75.py`. La migración del 75 % conserva cuarentenas y eventos previos, añade configuración y crea `detection_alerts` y `sensor_telemetry`. Sus contadores y alertas comienzan vacíos; no se inventa historia a partir de los logs. Un esquema del 50 % sin migrar se rechaza al iniciar la API.
 
 La tarea `scripts/archive_logs.py` está prevista para cron: considera sólo los `.log` con nombres generados por `AuditLogWriter`, pertenecientes a días ya cerrados y con fecha de modificación anterior a seis meses calendario. Genera un `.log.tar.gz` por archivo, verifica que su contenido recuperado coincida en tamaño y SHA-256 con el original y recién entonces elimina el `.log`. Usa bloqueos para no archivar un archivo en escritura ni solaparse con otra ejecución. Conviene conservar los `.tar.gz` con una política de retención aparte: comprimir reduce espacio, pero no impone una fecha de borrado del archivo comprimido. El cron y el proceso FastAPI deben tener permisos compatibles sobre los directorios configurados.
 
@@ -336,6 +361,8 @@ Los valores exactos y parámetros de la corrida están en `SentinelAI-Model/repo
 | `SENTINEL_QUARANTINE_SECONDS` | Duración de la cuarentena; por defecto 60 segundos. |
 | `SENTINEL_ALERT_TTL_HOURS` | Vigencia de alerta crítica; por defecto 24 horas. |
 | `SENTINEL_ALERT_UPDATE_SECONDS` | Intervalo mínimo entre actualizaciones de una misma alerta crítica; por defecto 300 segundos. |
+| `SENTINEL_LINK_STATE_TTL_SECONDS` | Vigencia de un reporte explícito del enlace; por defecto 120 segundos. |
+| `SENTINEL_ADMIN_TOKEN_SHA256` | Hash SHA-256 hexadecimal del token administrativo de 32 caracteres o más. |
 | `SENTINEL_API_URL` | URL de destino de `integracion_sensor.py`; por defecto `http://localhost:8000/ingest`. |
 | `SENTINEL_CSV_FILE` | CSV usado por `integracion_sensor.py`; por defecto `SentinelAI-Edge/flujos_capturados.csv`. |
 | `SENTINEL_CSV_CHUNK_SIZE` | Filas leídas por bloque en el replay CSV de `integracion_sensor.py`; por defecto 512. |
@@ -357,4 +384,4 @@ Los datasets bajo `SentinelAI-Model/data/`, los `.log`, `.env` y el modelo `.h5`
 - Prometheus cuenta anomalías por `site_id`; los flujos totales y el último MSE son métricas globales de la instancia. Para observabilidad por sensor o sitio se necesitarían métricas adicionales con etiquetas controladas.
 - La evaluación completa por día ya reveló diferencias fuertes. Sigue pendiente la prueba externa con UNSW-NB15 después de obtener o extraer las mismas 78 características y verificar su correspondencia.
 
-El [README de la raíz](../README.md) resume la ejecución; este documento es la referencia de arquitectura y cambios de la rama `new-fix-50`. Las notas específicas de cada módulo están en [Backend](../SentinelAI-Backend/README.md) y [Modelo](../SentinelAI-Model/README.md).
+El [README de la raíz](../README.md) resume la ejecución; este documento es la referencia de arquitectura de la rama `75`. Las notas específicas están en [Backend](../SentinelAI-Backend/README.md) y [Modelo](../SentinelAI-Model/README.md).

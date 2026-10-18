@@ -17,8 +17,10 @@ try:
         ActiveQuarantine,
         Base,
         CriticalAlert,
+        DetectionAlert,
         MitigationEvent,
         Sensor,
+        SensorTelemetry,
         Site,
         SiteConfig,
     )
@@ -27,8 +29,10 @@ except ImportError:  # Uvicorn launched from SentinelAI-Backend.
         ActiveQuarantine,
         Base,
         CriticalAlert,
+        DetectionAlert,
         MitigationEvent,
         Sensor,
+        SensorTelemetry,
         Site,
         SiteConfig,
     )
@@ -52,7 +56,7 @@ BEGIN
         RAISE EXCEPTION 'mitigation_events is append-only' USING ERRCODE = '55000';
     END IF;
 
-    IF NEW.event_type = 'REVERSION' AND NOT EXISTS (
+    IF NEW.event_type IN ('REVERSION', 'MANUAL_REVERSION') AND NOT EXISTS (
         SELECT 1 FROM mitigation_events AS original
         WHERE original.id = NEW.original_event_id
           AND original.event_type = 'APPLY'
@@ -114,7 +118,7 @@ _SQLITE_GUARD_TRIGGERS = (
     """
     CREATE TRIGGER IF NOT EXISTS trg_mitigation_events_validate_reversion
     BEFORE INSERT ON mitigation_events
-    WHEN NEW.event_type = 'REVERSION'
+    WHEN NEW.event_type IN ('REVERSION', 'MANUAL_REVERSION')
     BEGIN
         SELECT CASE WHEN NOT EXISTS (
             SELECT 1 FROM mitigation_events AS original
@@ -183,6 +187,30 @@ def _verify_site_scoped_projections(connection: Connection) -> None:
             )
 
 
+def _verify_75_schema(connection: Connection) -> None:
+    """Reject an existing 50% database until its explicit 75% migration runs."""
+
+    inspector = inspect(connection)
+    config_columns = {column["name"] for column in inspector.get_columns("site_configs")}
+    if not {"informative_only_mode", "known_devices"} <= config_columns:
+        raise RuntimeError(
+            "site_configs uses the 50% schema; run migrate_75.py before starting the API"
+        )
+    tables = set(inspector.get_table_names())
+    if not {"detection_alerts", "sensor_telemetry"} <= tables:
+        raise RuntimeError("75% alert/telemetry tables are missing; run migrate_75.py")
+    telemetry_columns = {column["name"] for column in inspector.get_columns("sensor_telemetry")}
+    if "last_link_report_at" not in telemetry_columns:
+        raise RuntimeError("sensor_telemetry is missing link health state; run migrate_75.py")
+    if connection.dialect.name == "postgresql":
+        checks = {entry["name"]: entry["sqltext"]
+                  for entry in inspector.get_check_constraints("mitigation_events")}
+        if "MANUAL_REVERSION" not in checks.get("ck_mitigation_events_event_type", ""):
+            raise RuntimeError(
+                "mitigation_events uses the 50% event constraint; run migrate_75.py"
+            )
+
+
 def create_database_tables() -> None:
     """Create a fresh schema; never silently rewrite existing projection data.
 
@@ -196,5 +224,6 @@ def create_database_tables() -> None:
             connection.exec_driver_sql("SELECT pg_advisory_xact_lock(590041852)")
         Base.metadata.create_all(bind=connection)
         _verify_site_scoped_projections(connection)
+        _verify_75_schema(connection)
         # If the table predated this release, after_create did not run.
         ensure_mitigation_event_guards(connection)

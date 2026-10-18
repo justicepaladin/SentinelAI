@@ -104,3 +104,24 @@ Prueba rápida de la lógica del evaluador (modelo sintético, sin TensorFlow):
 ```bash
 python -m unittest discover -s SentinelAI-Model/tests -v
 ```
+
+## Comparación estadística de umbrales
+
+`threshold_analysis.py` calcula los MSE benignos del lunes con el modelo y
+scaler congelados, aplica D'Agostino-Pearson K², informa asimetría y curtosis,
+y compara `μ + 3σ`, el `τ = 0.000308` desplegado, P99 recalculado, P99.5 y
+P99.9. Las tasas FPR y F1 se miden sobre martes a viernes. El lunes **ya fue
+usado para entrenar** el modelo y ajustar el scaler, así que esta calibración
+es dentro de muestra; el reporte identifica esa limitación y no presenta el
+P99 como garantía de FPR fuera de muestra.
+
+```bash
+python SentinelAI-Model/threshold_analysis.py \
+  --cic-dir SentinelAI-Model/data \
+  --output docs/threshold_justification.md
+```
+
+Por defecto usa todos los CSV. Para una prueba exploratoria se pueden indicar
+`--calibration-sample-fraction` y `--evaluation-sample-fraction` menores que 1;
+el reporte registra fracciones y semilla. Requiere `scipy`, incluido en
+`requirements-validation.txt`.

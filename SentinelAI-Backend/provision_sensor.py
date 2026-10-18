@@ -44,6 +44,10 @@ def build_parser() -> argparse.ArgumentParser:
     response.add_argument("--active-response", action="store_true", dest="active_response")
     response.add_argument("--disable-active-response", action="store_false", dest="active_response")
     parser.set_defaults(active_response=None)
+    learning = parser.add_mutually_exclusive_group()
+    learning.add_argument("--informative-only", action="store_true", dest="informative_only")
+    learning.add_argument("--disable-informative-only", action="store_false", dest="informative_only")
+    parser.set_defaults(informative_only=None)
     return parser
 
 
@@ -74,6 +78,8 @@ def provision_sensor(args: argparse.Namespace) -> str:
                 site_id=site.id,
                 custom_mse_threshold=args.threshold,
                 active_response_enabled=bool(args.active_response),
+                informative_only_mode=(True if args.informative_only is None
+                                       else args.informative_only),
             )
             db.add(config)
         else:
@@ -81,6 +87,8 @@ def provision_sensor(args: argparse.Namespace) -> str:
                 config.custom_mse_threshold = args.threshold
             if args.active_response is not None:
                 config.active_response_enabled = args.active_response
+            if args.informative_only is not None:
+                config.informative_only_mode = args.informative_only
 
         existing = db.scalar(
             select(Sensor).where(Sensor.site_id == site.id, Sensor.name == sensor_name)
