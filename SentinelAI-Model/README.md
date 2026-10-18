@@ -125,3 +125,15 @@ Por defecto usa todos los CSV. Para una prueba exploratoria se pueden indicar
 `--calibration-sample-fraction` y `--evaluation-sample-fraction` menores que 1;
 el reporte registra fracciones y semilla. Requiere `scipy`, incluido en
 `requirements-validation.txt`.
+
+### Obtención de Datasets (Validación y Replay)
+Para reproducir las simulaciones y las evaluaciones de generalización (OOD), el sistema requiere los archivos CSV originales. Por cuestiones de tamaño y licencias, no están incluidos en este repositorio.
+
+Deberás descargarlos desde el portal oficial del Instituto Canadiense de Ciberseguridad (CIC - UNB) y colocarlos en `SentinelAI-Model/data/`:
+
+1. **CIC-IDS2017 (Dataset Principal de Entrenamiento/Test):**
+   - **Enlace:** [Intrusion Detection Evaluation Dataset (CIC-IDS2017)](https://www.unb.ca/cic/datasets/ids-2017.html)
+   - *Nota:* Descargar la versión "MachineLearningCSV" generada con CICFlowMeter.
+2. **CIC-UNSW-NB15 (Dataset Externo para Validación OOD):**
+   - **Enlace:** [Re-extracted UNSW-NB15 Dataset (CIC-UNSW-NB15)](https://www.unb.ca/cic/datasets/cic-unsw-nb15.html)
+   - *Nota:* Utilizar esta versión re-extraída con CICFlowMeter para garantizar la total compatibilidad del vector de 78 características con el Autoencoder de SentinelAI.
