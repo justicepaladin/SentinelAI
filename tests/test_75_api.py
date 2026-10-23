@@ -299,6 +299,41 @@ class Api75Tests(unittest.TestCase):
         )[0], 404)
         self.assertEqual(request_json("GET", path, token=self.admin_token)[1], updated)
 
+    def test_sites_list_is_admin_global_and_sensor_scoped(self) -> None:
+        with self.session_factory.begin() as db:
+            db.add(Site(slug="site-c", name="Site C", is_active=False))
+            db.execute(update(SiteConfig).where(SiteConfig.site_id == self.site_a_id).values(
+                custom_mse_threshold=0.002, known_devices=["10.0.0.0/24"],
+                informative_only_mode=False,
+            ))
+
+        status, sites = request_json("GET", "/sites", token=self.admin_token)
+        self.assertEqual(status, 200)
+        self.assertEqual([site["slug"] for site in sites], ["site-a", "site-b", "site-c"])
+        first = sites[0]
+        self.assertEqual(set(first), {"id", "slug", "name", "is_active", "config"})
+        self.assertEqual(first["config"], {
+            "site_id": self.site_a_id, "custom_mse_threshold": 0.002,
+            "active_response_enabled": True, "informative_only_mode": False,
+            "known_devices": ["10.0.0.0/24"],
+        })
+        # A site without a SiteConfig row reports the same defaults as /config.
+        self.assertFalse(sites[2]["is_active"])
+        self.assertEqual(sites[2]["config"], {
+            "site_id": sites[2]["id"], "custom_mse_threshold": None,
+            "active_response_enabled": False, "informative_only_mode": True,
+            "known_devices": [],
+        })
+
+        status, own = request_json("GET", "/sites", token=self.sensor_token_b)
+        self.assertEqual(status, 200)
+        self.assertEqual([site["id"] for site in own], [self.site_b_id])
+
+        self.assertEqual(request_json("GET", "/sites")[0], 401)
+        self.assertEqual(request_json("GET", "/sites", token="x" * 40)[0], 401)
+        with patch.object(main, "list_sites", side_effect=SQLAlchemyError("down")):
+            self.assertEqual(request_json("GET", "/sites", token=self.admin_token)[0], 503)
+
     def test_authenticated_ingest_uses_updated_site_threshold_immediately(self) -> None:
         config_path = f"/sites/{self.site_a_id}/config"
         status, _ = request_json(

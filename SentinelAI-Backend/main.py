@@ -42,6 +42,7 @@ try:
         get_sensor_telemetry,
         get_site_config,
         list_quarantines_for_recovery,
+        list_sites,
         record_detection_state,
         release_quarantine_state,
         update_sensor_telemetry,
@@ -59,6 +60,7 @@ except ImportError:  # También permite iniciar Uvicorn desde SentinelAI-Backend
         get_sensor_telemetry,
         get_site_config,
         list_quarantines_for_recovery,
+        list_sites,
         record_detection_state,
         release_quarantine_state,
         update_sensor_telemetry,
@@ -232,6 +234,14 @@ class SiteConfigView(BaseModel):
     active_response_enabled: bool
     informative_only_mode: bool
     known_devices: list[str]
+
+
+class SiteView(BaseModel):
+    id: int
+    slug: str
+    name: str
+    is_active: bool
+    config: SiteConfigView
 
 
 class SiteConfigUpdate(BaseModel):
@@ -957,6 +967,23 @@ def _config_view(site_id: int, config: Any) -> SiteConfigView:
         informative_only_mode=bool(config.informative_only_mode) if config else True,
         known_devices=list(config.known_devices or ()) if config else [],
     )
+
+
+@app.get("/sites", response_model=list[SiteView], tags=["operations"])
+def get_sites(
+    principal: Annotated[AdminIdentity | SensorIdentity, Depends(get_authenticated_reader)],
+) -> list[SiteView]:
+    """List sites with their configuration; a sensor sees only its own site."""
+
+    try:
+        rows = list_sites(principal.site_id if isinstance(principal, SensorIdentity) else None)
+    except SQLAlchemyError as exc:
+        raise HTTPException(status_code=503, detail="Site database is unavailable") from exc
+    return [
+        SiteView(id=site.id, slug=site.slug, name=site.name, is_active=site.is_active,
+                 config=_config_view(site.id, config))
+        for site, config in rows
+    ]
 
 
 @app.get("/sites/{site_id}/config", response_model=SiteConfigView, tags=["operations"])

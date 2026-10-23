@@ -211,6 +211,16 @@ def get_site_config(site_id: int) -> tuple[Site, SiteConfig | None] | None:
         return site, db.get(SiteConfig, site_id)
 
 
+def list_sites(site_id: int | None = None) -> list[tuple[Site, SiteConfig | None]]:
+    """Return sites with their optional configuration, ordered by id."""
+
+    stmt = select(Site, SiteConfig).outerjoin(SiteConfig, SiteConfig.site_id == Site.id)
+    if site_id is not None:
+        stmt = stmt.where(Site.id == site_id)
+    with SessionLocal() as db:
+        return [(site, config) for site, config in db.execute(stmt.order_by(Site.id))]
+
+
 def update_site_config(site_id: int, changes: dict[str, object]) -> tuple[Site, SiteConfig] | None:
     """Apply validated partial configuration changes transactionally."""
 
