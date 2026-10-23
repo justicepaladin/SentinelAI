@@ -40,6 +40,7 @@ try:
         list_mitigation_events,
         list_alerts,
         find_active_quarantines,
+        get_alert,
         list_active_quarantines,
         get_sensor_telemetry,
         get_site_config,
@@ -61,6 +62,7 @@ except ImportError:  # También permite iniciar Uvicorn desde SentinelAI-Backend
         list_mitigation_events,
         list_alerts,
         find_active_quarantines,
+        get_alert,
         list_active_quarantines,
         get_sensor_telemetry,
         get_site_config,
@@ -1014,6 +1016,22 @@ def get_mitigation_events(
     except SQLAlchemyError as exc:
         raise HTTPException(status_code=503, detail="Mitigation event database is unavailable") from exc
     return [MitigationEventView.model_validate(row, from_attributes=True) for row in rows]
+
+
+@app.get("/alerts/{alert_id}", response_model=AlertView, tags=["operations"])
+def get_alert_detail(
+    alert_id: int,
+    principal: Annotated[AdminIdentity | SensorIdentity, Depends(get_authenticated_reader)],
+) -> AlertView:
+    """Read one alert; other sites' alerts look nonexistent to a sensor."""
+
+    try:
+        row = get_alert(alert_id)
+    except SQLAlchemyError as exc:
+        raise HTTPException(status_code=503, detail="Alert database is unavailable") from exc
+    if row is None or (isinstance(principal, SensorIdentity) and row.site_id != principal.site_id):
+        raise HTTPException(status_code=404, detail="Alert not found")
+    return AlertView.model_validate(row, from_attributes=True)
 
 
 @app.get("/sensors/{sensor_id}/telemetry", response_model=SensorTelemetryView,

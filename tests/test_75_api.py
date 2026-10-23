@@ -335,6 +335,30 @@ class Api75Tests(unittest.TestCase):
             self.assertEqual(request_json("GET", "/alerts", token=self.admin_token,
                                           query=bad)[0], 422, bad)
 
+    def test_alert_detail_hides_other_sites_from_sensors(self) -> None:
+        self._seed_alert(self.site_a_id, self.sensor_a_id, "10.0.0.5", "critical")
+        self._seed_alert(self.site_b_id, self.sensor_b_id, "10.0.0.6", "warning")
+        status, listed = request_json("GET", "/alerts", token=self.admin_token)
+        by_site = {row["site_id"]: row for row in listed}
+        alert_a, alert_b = by_site[self.site_a_id], by_site[self.site_b_id]
+
+        status, detail = request_json("GET", f"/alerts/{alert_a['id']}", token=self.admin_token)
+        self.assertEqual((status, detail), (200, alert_a))
+        self.assertEqual(request_json("GET", f"/alerts/{alert_b['id']}", token=self.admin_token)[1], alert_b)
+        self.assertEqual(request_json("GET", f"/alerts/{alert_a['id']}",
+                                      token=self.sensor_token_a), (200, alert_a))
+        # Another site's alert is indistinguishable from a missing one.
+        status, hidden = request_json("GET", f"/alerts/{alert_b['id']}", token=self.sensor_token_a)
+        status_missing, missing = request_json("GET", "/alerts/99999", token=self.sensor_token_a)
+        self.assertEqual((status, status_missing), (404, 404))
+        self.assertEqual(hidden, missing)
+        self.assertEqual(request_json("GET", "/alerts/99999", token=self.admin_token)[0], 404)
+        self.assertEqual(request_json("GET", f"/alerts/{alert_a['id']}")[0], 401)
+        self.assertEqual(request_json("GET", "/alerts/abc", token=self.admin_token)[0], 422)
+        with patch.object(main, "get_alert", side_effect=SQLAlchemyError("down")):
+            self.assertEqual(request_json("GET", f"/alerts/{alert_a['id']}",
+                                          token=self.admin_token)[0], 503)
+
     def test_site_config_is_admin_mutable_and_site_scoped_for_sensors(self) -> None:
         path = f"/sites/{self.site_a_id}/config"
         status, initial = request_json("GET", path, token=self.sensor_token_a)

@@ -231,6 +231,11 @@ def list_mitigation_events(
                                              MitigationEvent.id.desc()).limit(limit)))
 
 
+def get_alert(alert_id: int) -> DetectionAlert | None:
+    with SessionLocal() as db:
+        return db.get(DetectionAlert, alert_id)
+
+
 def get_site_config(site_id: int) -> tuple[Site, SiteConfig | None] | None:
     with SessionLocal() as db:
         site = db.get(Site, site_id)
