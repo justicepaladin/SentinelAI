@@ -282,6 +282,59 @@ class Api75Tests(unittest.TestCase):
         )[0], 422)
         self.assertEqual(request_json("GET", "/alerts")[0], 401)
 
+    def test_alert_time_device_and_cursor_filters(self) -> None:
+        base = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+        for minute, source_ip, unknown in ((0, "10.0.0.1", False), (10, "10.0.0.2", True),
+                                           (20, "10.0.0.3", False), (30, "10.0.0.4", True)):
+            self._seed_alert(self.site_a_id, self.sensor_a_id, source_ip, "high",
+                             occurred_at=base + timedelta(minutes=minute))
+            if unknown:
+                with self.session_factory.begin() as db:
+                    db.execute(update(DetectionAlert)
+                               .where(DetectionAlert.source_ip == source_ip)
+                               .values(unrecognized_device=True))
+        self._seed_alert(self.site_b_id, self.sensor_b_id, "10.0.0.9", "high",
+                         occurred_at=base + timedelta(minutes=15))
+
+        def sources(**query: Any) -> list[str]:
+            status, rows = request_json("GET", "/alerts", token=self.admin_token, query=query)
+            self.assertEqual(status, 200, query)
+            return [row["source_ip"] for row in rows]
+
+        self.assertEqual(sources(), ["10.0.0.4", "10.0.0.3", "10.0.0.9", "10.0.0.2", "10.0.0.1"])
+        # since is inclusive, until exclusive.
+        self.assertEqual(sources(since=(base + timedelta(minutes=10)).isoformat(),
+                                 until=(base + timedelta(minutes=30)).isoformat(),
+                                 site_id=self.site_a_id), ["10.0.0.3", "10.0.0.2"])
+        # Naive timestamps are UTC; offsets are honored (12:10Z == 09:10-03:00).
+        self.assertEqual(sources(since="2026-01-01T12:20:00", site_id=self.site_a_id),
+                         ["10.0.0.4", "10.0.0.3"])
+        self.assertEqual(sources(since="2026-01-01T09:20:00-03:00", site_id=self.site_a_id),
+                         ["10.0.0.4", "10.0.0.3"])
+        self.assertEqual(sources(until="2026-01-01T09:10:00-03:00"), ["10.0.0.1"])
+        self.assertEqual(sources(unrecognized_device="true"), ["10.0.0.4", "10.0.0.2"])
+        self.assertEqual(sources(unrecognized_device="false", site_id=self.site_a_id),
+                         ["10.0.0.3", "10.0.0.1"])
+
+        # Cursor paging walks back through the newest-first list without gaps.
+        status, page = request_json("GET", "/alerts", token=self.admin_token,
+                                    query={"site_id": self.site_a_id, "limit": 3})
+        self.assertEqual([row["source_ip"] for row in page], ["10.0.0.4", "10.0.0.3", "10.0.0.2"])
+        status, page = request_json("GET", "/alerts", token=self.admin_token,
+                                    query={"site_id": self.site_a_id, "limit": 3,
+                                           "before_id": page[-1]["id"]})
+        self.assertEqual([row["source_ip"] for row in page], ["10.0.0.1"])
+        self.assertIsInstance(page, list)
+
+        status, own = request_json("GET", "/alerts", token=self.sensor_token_b,
+                                   query={"since": base.isoformat(), "unrecognized_device": "false"})
+        self.assertEqual((status, [row["source_ip"] for row in own]), (200, ["10.0.0.9"]))
+        for bad in ({"before_id": 0}, {"since": "ayer"}, {"unrecognized_device": "quizas"},
+                    {"since": "2026-01-02T00:00:00Z", "until": "2026-01-01T00:00:00Z"},
+                    {"since": "2026-01-01T00:00:00Z", "until": "2026-01-01T00:00:00Z"}):
+            self.assertEqual(request_json("GET", "/alerts", token=self.admin_token,
+                                          query=bad)[0], 422, bad)
+
     def test_site_config_is_admin_mutable_and_site_scoped_for_sensors(self) -> None:
         path = f"/sites/{self.site_a_id}/config"
         status, initial = request_json("GET", path, token=self.sensor_token_a)

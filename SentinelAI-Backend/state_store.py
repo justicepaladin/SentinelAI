@@ -186,8 +186,13 @@ def find_active_quarantines(source_ip: str, site_id: int | None = None) -> list[
 def list_alerts(
     *, site_id: int | None = None, sensor_id: int | None = None,
     source_ip: str | None = None, severity: str | None = None, limit: int = 100,
+    since: datetime | None = None, until: datetime | None = None,
+    unrecognized_device: bool | None = None, before_id: int | None = None,
 ) -> list[DetectionAlert]:
-    """Return recent alerts with composable filters and bounded output."""
+    """Return recent alerts with composable filters and bounded output.
+
+    ``since`` is inclusive, ``until`` exclusive; ``before_id`` pages backwards.
+    """
 
     stmt = select(DetectionAlert)
     if site_id is not None:
@@ -198,6 +203,14 @@ def list_alerts(
         stmt = stmt.where(DetectionAlert.source_ip == source_ip)
     if severity is not None:
         stmt = stmt.where(DetectionAlert.severity == severity)
+    if since is not None:
+        stmt = stmt.where(DetectionAlert.occurred_at >= since)
+    if until is not None:
+        stmt = stmt.where(DetectionAlert.occurred_at < until)
+    if unrecognized_device is not None:
+        stmt = stmt.where(DetectionAlert.unrecognized_device.is_(unrecognized_device))
+    if before_id is not None:
+        stmt = stmt.where(DetectionAlert.id < before_id)
     with SessionLocal() as db:
         return list(db.scalars(stmt.order_by(DetectionAlert.occurred_at.desc(),
                                              DetectionAlert.id.desc()).limit(limit)))

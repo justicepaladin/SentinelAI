@@ -933,9 +933,21 @@ def get_alerts(
     sensor_id: int | None = Query(default=None, gt=0),
     source_ip: IPvAnyAddress | None = None,
     severity: Literal["warning", "high", "critical"] | None = None,
+    since: datetime | None = None,
+    until: datetime | None = None,
+    unrecognized_device: bool | None = None,
+    before_id: int | None = Query(default=None, gt=0),
     limit: int = Query(default=100, ge=1, le=1000),
 ) -> list[AlertView]:
-    """List recent alerts; a sensor may read only its own site's alerts."""
+    """List recent alerts; a sensor may read only its own site's alerts.
+
+    ``since`` is inclusive and ``until`` exclusive (naive values are UTC);
+    ``before_id`` returns only alerts with a smaller id, to page backwards.
+    """
+
+    since, until = _as_utc(since), _as_utc(until)
+    if since is not None and until is not None and since >= until:
+        raise HTTPException(status_code=422, detail="since must be earlier than until")
 
     if isinstance(principal, SensorIdentity):
         if site_id is not None and site_id != principal.site_id:
@@ -944,7 +956,8 @@ def get_alerts(
     try:
         rows = list_alerts(site_id=site_id, sensor_id=sensor_id,
                            source_ip=str(source_ip) if source_ip is not None else None,
-                           severity=severity, limit=limit)
+                           severity=severity, limit=limit, since=since, until=until,
+                           unrecognized_device=unrecognized_device, before_id=before_id)
     except SQLAlchemyError as exc:
         raise HTTPException(status_code=503, detail="Alert database is unavailable") from exc
     return [AlertView.model_validate(row, from_attributes=True) for row in rows]
@@ -961,6 +974,14 @@ def _telemetry_fields(sensor: Any, telemetry: Any) -> dict[str, Any]:
         last_link_degraded=telemetry.last_link_degraded if telemetry else False,
         last_link_report_at=telemetry.last_link_report_at if telemetry else None,
     )
+
+
+def _as_utc(value: datetime | None) -> datetime | None:
+    """Interpret naive timestamps as UTC and normalize offsets for comparison."""
+
+    if value is None:
+        return None
+    return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
 
 
 def _reader_site_scope(
