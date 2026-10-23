@@ -224,6 +224,25 @@ class Api75Tests(unittest.TestCase):
             ))
             return applied.id
 
+    def _seed_event(
+        self, site_id: int, source_ip: str, occurred_at: datetime, *,
+        event_type: str = "APPLY", original_event_id: int | None = None,
+        sensor_id: int | None = None, nullable_fields: bool = False,
+        reason: str | None = None,
+    ) -> int:
+        with self.session_factory.begin() as db:
+            row = MitigationEvent(
+                site_id=site_id, sensor_id=sensor_id, event_type=event_type,
+                original_event_id=original_event_id, source_ip=source_ip,
+                destination_ip=None if nullable_fields else "198.51.100.8",
+                destination_port=None if nullable_fields else 443,
+                mse_score=None if nullable_fields else 0.01,
+                reason=reason, occurred_at=occurred_at,
+            )
+            db.add(row)
+            db.flush()
+            return row.id
+
     def test_alert_filters_and_site_scoped_reader_permissions(self) -> None:
         self._seed_alert(self.site_a_id, self.sensor_a_id, "10.0.0.5", "warning")
         self._seed_alert(self.site_a_id, self.sensor_a_id, "10.0.0.6", "high")
@@ -263,6 +282,83 @@ class Api75Tests(unittest.TestCase):
         )[0], 422)
         self.assertEqual(request_json("GET", "/alerts")[0], 401)
 
+    def test_alert_time_device_and_cursor_filters(self) -> None:
+        base = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+        for minute, source_ip, unknown in ((0, "10.0.0.1", False), (10, "10.0.0.2", True),
+                                           (20, "10.0.0.3", False), (30, "10.0.0.4", True)):
+            self._seed_alert(self.site_a_id, self.sensor_a_id, source_ip, "high",
+                             occurred_at=base + timedelta(minutes=minute))
+            if unknown:
+                with self.session_factory.begin() as db:
+                    db.execute(update(DetectionAlert)
+                               .where(DetectionAlert.source_ip == source_ip)
+                               .values(unrecognized_device=True))
+        self._seed_alert(self.site_b_id, self.sensor_b_id, "10.0.0.9", "high",
+                         occurred_at=base + timedelta(minutes=15))
+
+        def sources(**query: Any) -> list[str]:
+            status, rows = request_json("GET", "/alerts", token=self.admin_token, query=query)
+            self.assertEqual(status, 200, query)
+            return [row["source_ip"] for row in rows]
+
+        self.assertEqual(sources(), ["10.0.0.4", "10.0.0.3", "10.0.0.9", "10.0.0.2", "10.0.0.1"])
+        # since is inclusive, until exclusive.
+        self.assertEqual(sources(since=(base + timedelta(minutes=10)).isoformat(),
+                                 until=(base + timedelta(minutes=30)).isoformat(),
+                                 site_id=self.site_a_id), ["10.0.0.3", "10.0.0.2"])
+        # Naive timestamps are UTC; offsets are honored (12:10Z == 09:10-03:00).
+        self.assertEqual(sources(since="2026-01-01T12:20:00", site_id=self.site_a_id),
+                         ["10.0.0.4", "10.0.0.3"])
+        self.assertEqual(sources(since="2026-01-01T09:20:00-03:00", site_id=self.site_a_id),
+                         ["10.0.0.4", "10.0.0.3"])
+        self.assertEqual(sources(until="2026-01-01T09:10:00-03:00"), ["10.0.0.1"])
+        self.assertEqual(sources(unrecognized_device="true"), ["10.0.0.4", "10.0.0.2"])
+        self.assertEqual(sources(unrecognized_device="false", site_id=self.site_a_id),
+                         ["10.0.0.3", "10.0.0.1"])
+
+        # Cursor paging walks back through the newest-first list without gaps.
+        status, page = request_json("GET", "/alerts", token=self.admin_token,
+                                    query={"site_id": self.site_a_id, "limit": 3})
+        self.assertEqual([row["source_ip"] for row in page], ["10.0.0.4", "10.0.0.3", "10.0.0.2"])
+        status, page = request_json("GET", "/alerts", token=self.admin_token,
+                                    query={"site_id": self.site_a_id, "limit": 3,
+                                           "before_id": page[-1]["id"]})
+        self.assertEqual([row["source_ip"] for row in page], ["10.0.0.1"])
+        self.assertIsInstance(page, list)
+
+        status, own = request_json("GET", "/alerts", token=self.sensor_token_b,
+                                   query={"since": base.isoformat(), "unrecognized_device": "false"})
+        self.assertEqual((status, [row["source_ip"] for row in own]), (200, ["10.0.0.9"]))
+        for bad in ({"before_id": 0}, {"since": "ayer"}, {"unrecognized_device": "quizas"},
+                    {"since": "2026-01-02T00:00:00Z", "until": "2026-01-01T00:00:00Z"},
+                    {"since": "2026-01-01T00:00:00Z", "until": "2026-01-01T00:00:00Z"}):
+            self.assertEqual(request_json("GET", "/alerts", token=self.admin_token,
+                                          query=bad)[0], 422, bad)
+
+    def test_alert_detail_hides_other_sites_from_sensors(self) -> None:
+        self._seed_alert(self.site_a_id, self.sensor_a_id, "10.0.0.5", "critical")
+        self._seed_alert(self.site_b_id, self.sensor_b_id, "10.0.0.6", "warning")
+        status, listed = request_json("GET", "/alerts", token=self.admin_token)
+        by_site = {row["site_id"]: row for row in listed}
+        alert_a, alert_b = by_site[self.site_a_id], by_site[self.site_b_id]
+
+        status, detail = request_json("GET", f"/alerts/{alert_a['id']}", token=self.admin_token)
+        self.assertEqual((status, detail), (200, alert_a))
+        self.assertEqual(request_json("GET", f"/alerts/{alert_b['id']}", token=self.admin_token)[1], alert_b)
+        self.assertEqual(request_json("GET", f"/alerts/{alert_a['id']}",
+                                      token=self.sensor_token_a), (200, alert_a))
+        # Another site's alert is indistinguishable from a missing one.
+        status, hidden = request_json("GET", f"/alerts/{alert_b['id']}", token=self.sensor_token_a)
+        status_missing, missing = request_json("GET", "/alerts/99999", token=self.sensor_token_a)
+        self.assertEqual((status, status_missing), (404, 404))
+        self.assertEqual(hidden, missing)
+        self.assertEqual(request_json("GET", "/alerts/99999", token=self.admin_token)[0], 404)
+        self.assertEqual(request_json("GET", f"/alerts/{alert_a['id']}")[0], 401)
+        self.assertEqual(request_json("GET", "/alerts/abc", token=self.admin_token)[0], 422)
+        with patch.object(main, "get_alert", side_effect=SQLAlchemyError("down")):
+            self.assertEqual(request_json("GET", f"/alerts/{alert_a['id']}",
+                                          token=self.admin_token)[0], 503)
+
     def test_site_config_is_admin_mutable_and_site_scoped_for_sensors(self) -> None:
         path = f"/sites/{self.site_a_id}/config"
         status, initial = request_json("GET", path, token=self.sensor_token_a)
@@ -298,6 +394,193 @@ class Api75Tests(unittest.TestCase):
             "GET", "/sites/99999/config", token=self.admin_token,
         )[0], 404)
         self.assertEqual(request_json("GET", path, token=self.admin_token)[1], updated)
+
+    def test_sites_list_is_admin_global_and_sensor_scoped(self) -> None:
+        with self.session_factory.begin() as db:
+            db.add(Site(slug="site-c", name="Site C", is_active=False))
+            db.execute(update(SiteConfig).where(SiteConfig.site_id == self.site_a_id).values(
+                custom_mse_threshold=0.002, known_devices=["10.0.0.0/24"],
+                informative_only_mode=False,
+            ))
+
+        status, sites = request_json("GET", "/sites", token=self.admin_token)
+        self.assertEqual(status, 200)
+        self.assertEqual([site["slug"] for site in sites], ["site-a", "site-b", "site-c"])
+        first = sites[0]
+        self.assertEqual(set(first), {"id", "slug", "name", "is_active", "config"})
+        self.assertEqual(first["config"], {
+            "site_id": self.site_a_id, "custom_mse_threshold": 0.002,
+            "active_response_enabled": True, "informative_only_mode": False,
+            "known_devices": ["10.0.0.0/24"],
+        })
+        # A site without a SiteConfig row reports the same defaults as /config.
+        self.assertFalse(sites[2]["is_active"])
+        self.assertEqual(sites[2]["config"], {
+            "site_id": sites[2]["id"], "custom_mse_threshold": None,
+            "active_response_enabled": False, "informative_only_mode": True,
+            "known_devices": [],
+        })
+
+        status, own = request_json("GET", "/sites", token=self.sensor_token_b)
+        self.assertEqual(status, 200)
+        self.assertEqual([site["id"] for site in own], [self.site_b_id])
+
+        self.assertEqual(request_json("GET", "/sites")[0], 401)
+        self.assertEqual(request_json("GET", "/sites", token="x" * 40)[0], 401)
+        with patch.object(main, "list_sites", side_effect=SQLAlchemyError("down")):
+            self.assertEqual(request_json("GET", "/sites", token=self.admin_token)[0], 503)
+
+    def test_site_sensors_include_name_and_default_telemetry(self) -> None:
+        with self.session_factory.begin() as db:
+            db.add(Sensor(site_id=self.site_a_id, name="edge-a2", is_active=False,
+                          token_hash=hashlib.sha256(b"unused-token").hexdigest()))
+        path = f"/sites/{self.site_a_id}/sensors"
+
+        status, sensors = request_json("GET", path, token=self.admin_token)
+        self.assertEqual(status, 200)
+        self.assertEqual([(row["name"], row["is_active"]) for row in sensors],
+                         [("edge-a", True), ("edge-a2", False)])
+        self.assertEqual(sensors[0], {
+            "sensor_id": self.sensor_a_id, "site_id": self.site_a_id, "name": "edge-a",
+            "is_active": True, "last_heartbeat_at": None, "last_ingest_at": None,
+            "flow_count": 0, "last_link_degraded": False, "last_link_report_at": None,
+        })
+
+        self.assertEqual(request_json(
+            "POST", f"/sensors/{self.sensor_a_id}/heartbeat",
+            token=self.sensor_token_a, body={"link_degraded": True},
+        )[0], 200)
+        status, own = request_json("GET", path, token=self.sensor_token_a)
+        self.assertEqual(status, 200)
+        self.assertIsNotNone(own[0]["last_heartbeat_at"])
+        self.assertTrue(own[0]["last_link_degraded"])
+        self.assertIsNone(own[1]["last_heartbeat_at"])
+        self.assertEqual(request_json(
+            "GET", f"/sensors/{self.sensor_a_id}/telemetry", token=self.admin_token,
+        )[1]["last_heartbeat_at"], own[0]["last_heartbeat_at"])
+
+        self.assertEqual(request_json("GET", path, token=self.sensor_token_b)[0], 403)
+        self.assertEqual(request_json("GET", path)[0], 401)
+        self.assertEqual(request_json("GET", "/sites/99999/sensors", token=self.admin_token)[0], 404)
+        self.assertEqual(request_json("GET", "/sites/99999/sensors", token=self.sensor_token_a)[0], 403)
+        self.assertEqual(request_json("GET", "/sites/abc/sensors", token=self.admin_token)[0], 422)
+        with patch.object(main, "list_site_sensors", side_effect=SQLAlchemyError("down")):
+            self.assertEqual(request_json("GET", path, token=self.admin_token)[0], 503)
+
+    def test_mitigation_events_are_newest_first_filtered_and_site_scoped(self) -> None:
+        base = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+        apply_id = self._seed_event(self.site_a_id, "203.0.113.5", base,
+                                    sensor_id=self.sensor_a_id)
+        tie_id = self._seed_event(self.site_a_id, "203.0.113.6", base + timedelta(minutes=5),
+                                  sensor_id=self.sensor_a_id)
+        revert_id = self._seed_event(
+            self.site_a_id, "203.0.113.5", base + timedelta(minutes=5),
+            event_type="REVERSION", original_event_id=apply_id,
+            nullable_fields=True, reason="quarantine_timer_elapsed",
+        )
+        other_site_id = self._seed_event(self.site_b_id, "203.0.113.5",
+                                         base + timedelta(minutes=1),
+                                         sensor_id=self.sensor_b_id)
+
+        status, events = request_json("GET", "/mitigation-events", token=self.admin_token)
+        self.assertEqual(status, 200)
+        # occurred_at desc, ties broken by id desc.
+        self.assertEqual([row["id"] for row in events],
+                         [revert_id, tie_id, other_site_id, apply_id])
+        self.assertEqual(set(events[0]), {
+            "id", "site_id", "sensor_id", "event_type", "original_event_id", "source_ip",
+            "destination_ip", "destination_port", "mse_score", "reason", "occurred_at",
+        })
+        self.assertEqual(events[0]["event_type"], "REVERSION")
+        self.assertEqual(events[0]["original_event_id"], apply_id)
+        self.assertIsNone(events[0]["sensor_id"])
+        self.assertIsNone(events[0]["destination_ip"])
+        self.assertIsNone(events[0]["destination_port"])
+        self.assertIsNone(events[0]["mse_score"])
+        self.assertEqual(events[0]["reason"], "quarantine_timer_elapsed")
+        self.assertEqual(events[3]["destination_port"], 443)
+
+        status, rows = request_json("GET", "/mitigation-events", token=self.admin_token,
+                                    query={"site_id": self.site_a_id, "source_ip": "203.0.113.5"})
+        self.assertEqual(status, 200)
+        self.assertEqual([row["id"] for row in rows], [revert_id, apply_id])
+        status, rows = request_json("GET", "/mitigation-events", token=self.admin_token,
+                                    query={"limit": 2})
+        self.assertEqual([row["id"] for row in rows], [revert_id, tie_id])
+        self.assertEqual(request_json("GET", "/mitigation-events", token=self.admin_token,
+                                      query={"source_ip": "203.0.113.99"})[1], [])
+
+        status, own = request_json("GET", "/mitigation-events", token=self.sensor_token_b)
+        self.assertEqual(status, 200)
+        self.assertEqual([row["id"] for row in own], [other_site_id])
+        self.assertEqual(request_json("GET", "/mitigation-events", token=self.sensor_token_b,
+                                      query={"site_id": self.site_b_id})[0], 200)
+        self.assertEqual(request_json("GET", "/mitigation-events", token=self.sensor_token_b,
+                                      query={"site_id": self.site_a_id})[0], 403)
+
+        self.assertEqual(request_json("GET", "/mitigation-events")[0], 401)
+        for bad in ({"limit": 0}, {"limit": 1001}, {"site_id": 0}, {"source_ip": "not-an-ip"}):
+            self.assertEqual(request_json("GET", "/mitigation-events", token=self.admin_token,
+                                          query=bad)[0], 422, bad)
+        self.assertEqual(request_json("GET", "/mitigation-events", token=self.admin_token,
+                                      query={"limit": 1000})[0], 200)
+        with patch.object(main, "list_mitigation_events", side_effect=SQLAlchemyError("down")):
+            self.assertEqual(request_json("GET", "/mitigation-events",
+                                          token=self.admin_token)[0], 503)
+
+    def test_quarantines_list_only_live_rows_across_sites(self) -> None:
+        self._seed_quarantine(self.site_a_id, "203.0.113.5")
+        self._seed_quarantine(self.site_b_id, "203.0.113.5")
+        self._seed_quarantine(self.site_b_id, "203.0.113.6")
+        now = datetime.now(timezone.utc)
+        with self.session_factory.begin() as db:
+            db.add(ActiveQuarantine(
+                site_id=self.site_a_id, source_ip="203.0.113.7",
+                destination_ip="198.51.100.8", destination_port=80, mse_score=0.02,
+                quarantined_at=now - timedelta(minutes=30),
+                expires_at=now - timedelta(minutes=1),
+            ))
+            # Newest first; equal timestamps fall back to (site_id, source_ip).
+            for site_id, source_ip, offset in (
+                (self.site_b_id, "203.0.113.6", 1),
+                (self.site_a_id, "203.0.113.5", 0),
+                (self.site_b_id, "203.0.113.5", 0),
+            ):
+                db.execute(update(ActiveQuarantine).where(
+                    ActiveQuarantine.site_id == site_id,
+                    ActiveQuarantine.source_ip == source_ip,
+                ).values(quarantined_at=now + timedelta(minutes=offset)))
+
+        status, rows = request_json("GET", "/quarantines", token=self.admin_token)
+        self.assertEqual(status, 200)
+        self.assertEqual([(row["site_id"], row["source_ip"]) for row in rows], [
+            (self.site_b_id, "203.0.113.6"),
+            (self.site_a_id, "203.0.113.5"),
+            (self.site_b_id, "203.0.113.5"),
+        ])
+        self.assertEqual(set(rows[0]), {
+            "site_id", "source_ip", "destination_ip", "destination_port",
+            "mse_score", "quarantined_at", "expires_at",
+        })
+
+        status, rows = request_json("GET", "/quarantines", token=self.admin_token,
+                                    query={"site_id": self.site_a_id})
+        self.assertEqual([row["source_ip"] for row in rows], ["203.0.113.5"])
+        self.assertEqual(request_json("GET", "/quarantines", token=self.admin_token,
+                                      query={"site_id": 99999})[1], [])
+
+        status, own = request_json("GET", "/quarantines", token=self.sensor_token_a)
+        self.assertEqual(status, 200)
+        self.assertEqual({row["site_id"] for row in own}, {self.site_a_id})
+        self.assertEqual(request_json("GET", "/quarantines", token=self.sensor_token_a,
+                                      query={"site_id": self.site_b_id})[0], 403)
+        self.assertEqual(request_json("GET", "/quarantines")[0], 401)
+        self.assertEqual(request_json("GET", "/quarantines", token=self.admin_token,
+                                      query={"site_id": 0})[0], 422)
+        # The sensor-only dashboard endpoint keeps rejecting the admin token.
+        self.assertEqual(request_json("GET", "/dashboard/state", token=self.admin_token)[0], 401)
+        with patch.object(main, "list_active_quarantines", side_effect=SQLAlchemyError("down")):
+            self.assertEqual(request_json("GET", "/quarantines", token=self.admin_token)[0], 503)
 
     def test_authenticated_ingest_uses_updated_site_threshold_immediately(self) -> None:
         config_path = f"/sites/{self.site_a_id}/config"

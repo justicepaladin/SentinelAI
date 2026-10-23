@@ -186,8 +186,13 @@ def find_active_quarantines(source_ip: str, site_id: int | None = None) -> list[
 def list_alerts(
     *, site_id: int | None = None, sensor_id: int | None = None,
     source_ip: str | None = None, severity: str | None = None, limit: int = 100,
+    since: datetime | None = None, until: datetime | None = None,
+    unrecognized_device: bool | None = None, before_id: int | None = None,
 ) -> list[DetectionAlert]:
-    """Return recent alerts with composable filters and bounded output."""
+    """Return recent alerts with composable filters and bounded output.
+
+    ``since`` is inclusive, ``until`` exclusive; ``before_id`` pages backwards.
+    """
 
     stmt = select(DetectionAlert)
     if site_id is not None:
@@ -198,9 +203,37 @@ def list_alerts(
         stmt = stmt.where(DetectionAlert.source_ip == source_ip)
     if severity is not None:
         stmt = stmt.where(DetectionAlert.severity == severity)
+    if since is not None:
+        stmt = stmt.where(DetectionAlert.occurred_at >= since)
+    if until is not None:
+        stmt = stmt.where(DetectionAlert.occurred_at < until)
+    if unrecognized_device is not None:
+        stmt = stmt.where(DetectionAlert.unrecognized_device.is_(unrecognized_device))
+    if before_id is not None:
+        stmt = stmt.where(DetectionAlert.id < before_id)
     with SessionLocal() as db:
         return list(db.scalars(stmt.order_by(DetectionAlert.occurred_at.desc(),
                                              DetectionAlert.id.desc()).limit(limit)))
+
+
+def list_mitigation_events(
+    *, site_id: int | None = None, source_ip: str | None = None, limit: int = 100,
+) -> list[MitigationEvent]:
+    """Return firewall events, newest first, with bounded output."""
+
+    stmt = select(MitigationEvent)
+    if site_id is not None:
+        stmt = stmt.where(MitigationEvent.site_id == site_id)
+    if source_ip is not None:
+        stmt = stmt.where(MitigationEvent.source_ip == source_ip)
+    with SessionLocal() as db:
+        return list(db.scalars(stmt.order_by(MitigationEvent.occurred_at.desc(),
+                                             MitigationEvent.id.desc()).limit(limit)))
+
+
+def get_alert(alert_id: int) -> DetectionAlert | None:
+    with SessionLocal() as db:
+        return db.get(DetectionAlert, alert_id)
 
 
 def get_site_config(site_id: int) -> tuple[Site, SiteConfig | None] | None:
@@ -209,6 +242,16 @@ def get_site_config(site_id: int) -> tuple[Site, SiteConfig | None] | None:
         if site is None:
             return None
         return site, db.get(SiteConfig, site_id)
+
+
+def list_sites(site_id: int | None = None) -> list[tuple[Site, SiteConfig | None]]:
+    """Return sites with their optional configuration, ordered by id."""
+
+    stmt = select(Site, SiteConfig).outerjoin(SiteConfig, SiteConfig.site_id == Site.id)
+    if site_id is not None:
+        stmt = stmt.where(Site.id == site_id)
+    with SessionLocal() as db:
+        return [(site, config) for site, config in db.execute(stmt.order_by(Site.id))]
 
 
 def update_site_config(site_id: int, changes: dict[str, object]) -> tuple[Site, SiteConfig] | None:
@@ -269,6 +312,21 @@ def get_sensor_telemetry(sensor_id: int) -> tuple[Sensor, SensorTelemetry | None
         return sensor, db.get(SensorTelemetry, sensor_id)
 
 
+def list_site_sensors(site_id: int) -> list[tuple[Sensor, SensorTelemetry | None]] | None:
+    """Return a site's sensors with optional telemetry, or None if the site is unknown."""
+
+    with SessionLocal() as db:
+        if db.get(Site, site_id) is None:
+            return None
+        rows = db.execute(
+            select(Sensor, SensorTelemetry)
+            .outerjoin(SensorTelemetry, SensorTelemetry.sensor_id == Sensor.id)
+            .where(Sensor.site_id == site_id)
+            .order_by(Sensor.id)
+        )
+        return [(sensor, telemetry) for sensor, telemetry in rows]
+
+
 def list_current_state(site_id: int) -> tuple[list[ActiveQuarantine], list[CriticalAlert]]:
     """Return current dashboard state for exactly one authenticated site."""
 
@@ -295,6 +353,19 @@ def list_current_state(site_id: int) -> tuple[list[ActiveQuarantine], list[Criti
             )
         )
     return quarantines, alerts
+
+
+def list_active_quarantines(site_id: int | None = None) -> list[ActiveQuarantine]:
+    """Return unexpired quarantines for one site or, without a filter, all sites."""
+
+    stmt = select(ActiveQuarantine).where(ActiveQuarantine.expires_at > datetime.now(timezone.utc))
+    if site_id is not None:
+        stmt = stmt.where(ActiveQuarantine.site_id == site_id)
+    with SessionLocal() as db:
+        return list(db.scalars(stmt.order_by(
+            ActiveQuarantine.quarantined_at.desc(), ActiveQuarantine.site_id,
+            ActiveQuarantine.source_ip,
+        )))
 
 
 def list_quarantines_for_recovery() -> list[ActiveQuarantine]:

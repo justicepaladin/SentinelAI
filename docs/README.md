@@ -169,7 +169,12 @@ Este Compose sólo crea la red de laboratorio y una página de prueba. No arranc
 | Ruta | Uso |
 | --- | --- |
 | `POST /ingest` | Requiere token Bearer del sensor; responde MSE, decisión, inventario, mitigación y persistencia. Acepta `link_degraded`. |
-| `GET /alerts` | Lista alertas con filtros por sitio, sensor, IP y severidad; administración global o sensor de su propio sitio. |
+| `GET /alerts` | Lista alertas, más recientes primero, con filtros `site_id`, `sensor_id`, `source_ip`, `severity`, `since` (inclusivo), `until` (exclusivo), `unrecognized_device` y `limit` (1–1000, por defecto 100). `before_id` devuelve sólo ids menores para paginar hacia atrás. Fechas sin zona horaria se toman como UTC; `since >= until` devuelve 422. Administración global o sensor de su propio sitio (403 si pide otro). |
+| `GET /alerts/{alert_id}` | Una alerta. 404 si no existe o, para un sensor, si es de otro sitio. |
+| `GET /sites` | Sitios con `id`, `slug`, `name`, `is_active` y su configuración (valores por defecto si no hay `SiteConfig`). El administrador ve todos; un sensor, su sitio. |
+| `GET /sites/{site_id}/sensors` | Sensores del sitio con su nombre y la misma telemetría que `/sensors/{sensor_id}/telemetry` (ceros y `null` si aún no reportan). 404 si el sitio no existe; 403 para un sensor de otro sitio. |
+| `GET /mitigation-events` | Eventos de firewall (`APPLY`, `REVERSION`, `MANUAL_REVERSION`), más recientes primero (`occurred_at`, luego `id`), con filtros `site_id`, `source_ip` y `limit` (1–1000, por defecto 100). `destination_ip`, `destination_port` y `mse_score` pueden ser `null`. Administración global o sensor de su sitio (403 si pide otro). |
+| `GET /quarantines` | Cuarentenas vigentes (`expires_at` futuro) de todos los sitios, con `site_id`; filtro opcional `site_id`. Equivale a `/dashboard/state` para el administrador. Un sensor sólo ve su sitio (403 si pide otro). |
 | `GET /sensors/{sensor_id}/telemetry` y `POST /sensors/{sensor_id}/heartbeat` | Consulta de estadísticas y reporte de heartbeat del propio sensor. |
 | `GET /sites/{site_id}/config` y `PUT /sites/{site_id}/config` | Consulta y actualización del umbral, modos de respuesta e IP/subredes conocidas. PUT requiere administrador. |
 | `POST /quarantines/{source_ip}/revert` | Reversión manual por administrador, con evento inmutable en PostgreSQL. |
@@ -208,7 +213,7 @@ La respuesta normal tiene HTTP 200. `dashboard_state_persisted` vale `true` cuan
 
 | Requisito | Componente verificable |
 | --- | --- |
-| RF-05 | `GET /alerts` filtra alertas persistentes por sitio, sensor, IP y severidad; `POST /quarantines/{source_ip}/revert` exige token administrador, elimina la regla y agrega `MANUAL_REVERSION` inmutable. |
+| RF-05 | `GET /alerts` filtra alertas persistentes por sitio, sensor, IP, severidad, fechas y dispositivo no reconocido, y `GET /mitigation-events` expone el historial de firewall; `POST /quarantines/{source_ip}/revert` exige token administrador, elimina la regla y agrega `MANUAL_REVERSION` inmutable. |
 | RF-06 | `GET /sensors/{sensor_id}/telemetry` muestra último heartbeat, última ingesta, total de flujos y estado activo. `POST /sensors/{sensor_id}/heartbeat` registra heartbeat explícito. |
 | RF-07, RF-08, RNF-06 | `GET/PUT /sites/{site_id}/config` gestiona umbral, `active_response_enabled`, `informative_only_mode` e inventario CIDR. El modo informativo inicia activo. |
 | RNF-05 | Un flujo con `link_degraded=true` suspende `iptables`; si omite el campo, se usa un reporte explícito reciente del sensor durante 120 s por defecto. La detección y la alerta siguen activas. |
@@ -216,7 +221,7 @@ La respuesta normal tiene HTTP 200. `dashboard_state_persisted` vale `true` cuan
 | RNF-03, RNF-05, RNF-06 | [Benchmark medido](benchmark_rnf_results.md) con 500 peticiones y [CSV](benchmark_rnf_results.csv); usa modelo y scaler reales, con firewall y persistencia simulados en memoria. |
 | Objeción estadística | [Normalidad, FPR y F1 por umbral](threshold_justification.md), medidos con los CSV locales completos. |
 
-`PUT /sites/{site_id}/config` y la reversión manual usan un token administrador separado, cuyo SHA-256 hexadecimal se guarda en `SENTINEL_ADMIN_TOKEN_SHA256` en el `.env` del backend. Las consultas de alertas y configuración aceptan ese token o el de un sensor del mismo sitio. La telemetría de un sensor sólo puede leerla el administrador o ese sensor. La [guía del backend](../SentinelAI-Backend/README.md) incluye contratos y ejemplo de configuración.
+`PUT /sites/{site_id}/config` y la reversión manual usan un token administrador separado, cuyo SHA-256 hexadecimal se guarda en `SENTINEL_ADMIN_TOKEN_SHA256` en el `.env` del backend. Las consultas de alertas, sitios, sensores, eventos de mitigación, cuarentenas y configuración aceptan ese token o el de un sensor del mismo sitio; con el token de sensor sólo devuelven datos de su sitio. Todas responden 401 sin token válido, 422 ante parámetros inválidos y 503 si PostgreSQL no está disponible. La telemetría de un sensor sólo puede leerla el administrador o ese sensor. La [guía del backend](../SentinelAI-Backend/README.md) incluye contratos y ejemplo de configuración.
 
 ## 4. Persistencia y ciclo de vida de los logs
 
