@@ -334,6 +334,43 @@ class Api75Tests(unittest.TestCase):
         with patch.object(main, "list_sites", side_effect=SQLAlchemyError("down")):
             self.assertEqual(request_json("GET", "/sites", token=self.admin_token)[0], 503)
 
+    def test_site_sensors_include_name_and_default_telemetry(self) -> None:
+        with self.session_factory.begin() as db:
+            db.add(Sensor(site_id=self.site_a_id, name="edge-a2", is_active=False,
+                          token_hash=hashlib.sha256(b"unused-token").hexdigest()))
+        path = f"/sites/{self.site_a_id}/sensors"
+
+        status, sensors = request_json("GET", path, token=self.admin_token)
+        self.assertEqual(status, 200)
+        self.assertEqual([(row["name"], row["is_active"]) for row in sensors],
+                         [("edge-a", True), ("edge-a2", False)])
+        self.assertEqual(sensors[0], {
+            "sensor_id": self.sensor_a_id, "site_id": self.site_a_id, "name": "edge-a",
+            "is_active": True, "last_heartbeat_at": None, "last_ingest_at": None,
+            "flow_count": 0, "last_link_degraded": False, "last_link_report_at": None,
+        })
+
+        self.assertEqual(request_json(
+            "POST", f"/sensors/{self.sensor_a_id}/heartbeat",
+            token=self.sensor_token_a, body={"link_degraded": True},
+        )[0], 200)
+        status, own = request_json("GET", path, token=self.sensor_token_a)
+        self.assertEqual(status, 200)
+        self.assertIsNotNone(own[0]["last_heartbeat_at"])
+        self.assertTrue(own[0]["last_link_degraded"])
+        self.assertIsNone(own[1]["last_heartbeat_at"])
+        self.assertEqual(request_json(
+            "GET", f"/sensors/{self.sensor_a_id}/telemetry", token=self.admin_token,
+        )[1]["last_heartbeat_at"], own[0]["last_heartbeat_at"])
+
+        self.assertEqual(request_json("GET", path, token=self.sensor_token_b)[0], 403)
+        self.assertEqual(request_json("GET", path)[0], 401)
+        self.assertEqual(request_json("GET", "/sites/99999/sensors", token=self.admin_token)[0], 404)
+        self.assertEqual(request_json("GET", "/sites/99999/sensors", token=self.sensor_token_a)[0], 403)
+        self.assertEqual(request_json("GET", "/sites/abc/sensors", token=self.admin_token)[0], 422)
+        with patch.object(main, "list_site_sensors", side_effect=SQLAlchemyError("down")):
+            self.assertEqual(request_json("GET", path, token=self.admin_token)[0], 503)
+
     def test_authenticated_ingest_uses_updated_site_threshold_immediately(self) -> None:
         config_path = f"/sites/{self.site_a_id}/config"
         status, _ = request_json(

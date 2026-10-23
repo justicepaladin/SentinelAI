@@ -42,6 +42,7 @@ try:
         get_sensor_telemetry,
         get_site_config,
         list_quarantines_for_recovery,
+        list_site_sensors,
         list_sites,
         record_detection_state,
         release_quarantine_state,
@@ -60,6 +61,7 @@ except ImportError:  # También permite iniciar Uvicorn desde SentinelAI-Backend
         get_sensor_telemetry,
         get_site_config,
         list_quarantines_for_recovery,
+        list_site_sensors,
         list_sites,
         record_detection_state,
         release_quarantine_state,
@@ -222,6 +224,10 @@ class SensorTelemetryView(BaseModel):
     flow_count: int
     last_link_degraded: bool
     last_link_report_at: datetime | None
+
+
+class SiteSensorView(SensorTelemetryView):
+    name: str
 
 
 class HeartbeatPayload(BaseModel):
@@ -907,6 +913,19 @@ def get_alerts(
     return [AlertView.model_validate(row, from_attributes=True) for row in rows]
 
 
+def _telemetry_fields(sensor: Any, telemetry: Any) -> dict[str, Any]:
+    """Telemetry projection with the defaults used before a sensor reports."""
+
+    return dict(
+        sensor_id=sensor.id, site_id=sensor.site_id, is_active=sensor.is_active,
+        last_heartbeat_at=telemetry.last_heartbeat_at if telemetry else None,
+        last_ingest_at=telemetry.last_ingest_at if telemetry else None,
+        flow_count=telemetry.flow_count if telemetry else 0,
+        last_link_degraded=telemetry.last_link_degraded if telemetry else False,
+        last_link_report_at=telemetry.last_link_report_at if telemetry else None,
+    )
+
+
 @app.get("/sensors/{sensor_id}/telemetry", response_model=SensorTelemetryView,
          tags=["operations"])
 def sensor_telemetry(
@@ -922,14 +941,7 @@ def sensor_telemetry(
     if result is None:
         raise HTTPException(status_code=404, detail="Sensor not found")
     sensor, telemetry = result
-    return SensorTelemetryView(
-        sensor_id=sensor.id, site_id=sensor.site_id, is_active=sensor.is_active,
-        last_heartbeat_at=telemetry.last_heartbeat_at if telemetry else None,
-        last_ingest_at=telemetry.last_ingest_at if telemetry else None,
-        flow_count=telemetry.flow_count if telemetry else 0,
-        last_link_degraded=telemetry.last_link_degraded if telemetry else False,
-        last_link_report_at=telemetry.last_link_report_at if telemetry else None,
-    )
+    return SensorTelemetryView(**_telemetry_fields(sensor, telemetry))
 
 
 @app.post("/sensors/{sensor_id}/heartbeat", response_model=SensorTelemetryView,
@@ -984,6 +996,25 @@ def get_sites(
                  config=_config_view(site.id, config))
         for site, config in rows
     ]
+
+
+@app.get("/sites/{site_id}/sensors", response_model=list[SiteSensorView], tags=["operations"])
+def site_sensors(
+    site_id: int,
+    principal: Annotated[AdminIdentity | SensorIdentity, Depends(get_authenticated_reader)],
+) -> list[SiteSensorView]:
+    """List a site's sensors with telemetry; a sensor may read only its own site."""
+
+    if isinstance(principal, SensorIdentity) and principal.site_id != site_id:
+        raise HTTPException(status_code=403, detail="Cross-site sensor access is forbidden")
+    try:
+        rows = list_site_sensors(site_id)
+    except SQLAlchemyError as exc:
+        raise HTTPException(status_code=503, detail="Telemetry database is unavailable") from exc
+    if rows is None:
+        raise HTTPException(status_code=404, detail="Site not found")
+    return [SiteSensorView(name=sensor.name, **_telemetry_fields(sensor, telemetry))
+            for sensor, telemetry in rows]
 
 
 @app.get("/sites/{site_id}/config", response_model=SiteConfigView, tags=["operations"])

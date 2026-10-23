@@ -279,6 +279,21 @@ def get_sensor_telemetry(sensor_id: int) -> tuple[Sensor, SensorTelemetry | None
         return sensor, db.get(SensorTelemetry, sensor_id)
 
 
+def list_site_sensors(site_id: int) -> list[tuple[Sensor, SensorTelemetry | None]] | None:
+    """Return a site's sensors with optional telemetry, or None if the site is unknown."""
+
+    with SessionLocal() as db:
+        if db.get(Site, site_id) is None:
+            return None
+        rows = db.execute(
+            select(Sensor, SensorTelemetry)
+            .outerjoin(SensorTelemetry, SensorTelemetry.sensor_id == Sensor.id)
+            .where(Sensor.site_id == site_id)
+            .order_by(Sensor.id)
+        )
+        return [(sensor, telemetry) for sensor, telemetry in rows]
+
+
 def list_current_state(site_id: int) -> tuple[list[ActiveQuarantine], list[CriticalAlert]]:
     """Return current dashboard state for exactly one authenticated site."""
 
