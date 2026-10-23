@@ -203,6 +203,21 @@ def list_alerts(
                                              DetectionAlert.id.desc()).limit(limit)))
 
 
+def list_mitigation_events(
+    *, site_id: int | None = None, source_ip: str | None = None, limit: int = 100,
+) -> list[MitigationEvent]:
+    """Return firewall events, newest first, with bounded output."""
+
+    stmt = select(MitigationEvent)
+    if site_id is not None:
+        stmt = stmt.where(MitigationEvent.site_id == site_id)
+    if source_ip is not None:
+        stmt = stmt.where(MitigationEvent.source_ip == source_ip)
+    with SessionLocal() as db:
+        return list(db.scalars(stmt.order_by(MitigationEvent.occurred_at.desc(),
+                                             MitigationEvent.id.desc()).limit(limit)))
+
+
 def get_site_config(site_id: int) -> tuple[Site, SiteConfig | None] | None:
     with SessionLocal() as db:
         site = db.get(Site, site_id)

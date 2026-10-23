@@ -37,6 +37,7 @@ try:
     from .database import create_database_tables
     from .state_store import (
         list_current_state,
+        list_mitigation_events,
         list_alerts,
         find_active_quarantines,
         get_sensor_telemetry,
@@ -56,6 +57,7 @@ except ImportError:  # También permite iniciar Uvicorn desde SentinelAI-Backend
     from database import create_database_tables
     from state_store import (
         list_current_state,
+        list_mitigation_events,
         list_alerts,
         find_active_quarantines,
         get_sensor_telemetry,
@@ -228,6 +230,20 @@ class SensorTelemetryView(BaseModel):
 
 class SiteSensorView(SensorTelemetryView):
     name: str
+
+
+class MitigationEventView(BaseModel):
+    id: int
+    site_id: int
+    sensor_id: int | None
+    event_type: Literal["APPLY", "REVERSION", "MANUAL_REVERSION"]
+    original_event_id: int | None
+    source_ip: str
+    destination_ip: str | None
+    destination_port: int | None
+    mse_score: float | None
+    reason: str | None
+    occurred_at: datetime
 
 
 class HeartbeatPayload(BaseModel):
@@ -924,6 +940,38 @@ def _telemetry_fields(sensor: Any, telemetry: Any) -> dict[str, Any]:
         last_link_degraded=telemetry.last_link_degraded if telemetry else False,
         last_link_report_at=telemetry.last_link_report_at if telemetry else None,
     )
+
+
+def _reader_site_scope(
+    principal: AdminIdentity | SensorIdentity, site_id: int | None, resource: str,
+) -> int | None:
+    """Admins keep the requested site filter; a sensor is pinned to its own site."""
+
+    if isinstance(principal, SensorIdentity):
+        if site_id is not None and site_id != principal.site_id:
+            raise HTTPException(status_code=403, detail=f"Cross-site {resource} access is forbidden")
+        return principal.site_id
+    return site_id
+
+
+@app.get("/mitigation-events", response_model=list[MitigationEventView], tags=["operations"])
+def get_mitigation_events(
+    principal: Annotated[AdminIdentity | SensorIdentity, Depends(get_authenticated_reader)],
+    site_id: int | None = Query(default=None, gt=0),
+    source_ip: IPvAnyAddress | None = None,
+    limit: int = Query(default=100, ge=1, le=1000),
+) -> list[MitigationEventView]:
+    """List firewall events, newest first; a sensor may read only its own site's."""
+
+    site_id = _reader_site_scope(principal, site_id, "mitigation event")
+    try:
+        rows = list_mitigation_events(
+            site_id=site_id, source_ip=str(source_ip) if source_ip is not None else None,
+            limit=limit,
+        )
+    except SQLAlchemyError as exc:
+        raise HTTPException(status_code=503, detail="Mitigation event database is unavailable") from exc
+    return [MitigationEventView.model_validate(row, from_attributes=True) for row in rows]
 
 
 @app.get("/sensors/{sensor_id}/telemetry", response_model=SensorTelemetryView,

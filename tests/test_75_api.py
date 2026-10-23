@@ -224,6 +224,25 @@ class Api75Tests(unittest.TestCase):
             ))
             return applied.id
 
+    def _seed_event(
+        self, site_id: int, source_ip: str, occurred_at: datetime, *,
+        event_type: str = "APPLY", original_event_id: int | None = None,
+        sensor_id: int | None = None, nullable_fields: bool = False,
+        reason: str | None = None,
+    ) -> int:
+        with self.session_factory.begin() as db:
+            row = MitigationEvent(
+                site_id=site_id, sensor_id=sensor_id, event_type=event_type,
+                original_event_id=original_event_id, source_ip=source_ip,
+                destination_ip=None if nullable_fields else "198.51.100.8",
+                destination_port=None if nullable_fields else 443,
+                mse_score=None if nullable_fields else 0.01,
+                reason=reason, occurred_at=occurred_at,
+            )
+            db.add(row)
+            db.flush()
+            return row.id
+
     def test_alert_filters_and_site_scoped_reader_permissions(self) -> None:
         self._seed_alert(self.site_a_id, self.sensor_a_id, "10.0.0.5", "warning")
         self._seed_alert(self.site_a_id, self.sensor_a_id, "10.0.0.6", "high")
@@ -370,6 +389,67 @@ class Api75Tests(unittest.TestCase):
         self.assertEqual(request_json("GET", "/sites/abc/sensors", token=self.admin_token)[0], 422)
         with patch.object(main, "list_site_sensors", side_effect=SQLAlchemyError("down")):
             self.assertEqual(request_json("GET", path, token=self.admin_token)[0], 503)
+
+    def test_mitigation_events_are_newest_first_filtered_and_site_scoped(self) -> None:
+        base = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+        apply_id = self._seed_event(self.site_a_id, "203.0.113.5", base,
+                                    sensor_id=self.sensor_a_id)
+        tie_id = self._seed_event(self.site_a_id, "203.0.113.6", base + timedelta(minutes=5),
+                                  sensor_id=self.sensor_a_id)
+        revert_id = self._seed_event(
+            self.site_a_id, "203.0.113.5", base + timedelta(minutes=5),
+            event_type="REVERSION", original_event_id=apply_id,
+            nullable_fields=True, reason="quarantine_timer_elapsed",
+        )
+        other_site_id = self._seed_event(self.site_b_id, "203.0.113.5",
+                                         base + timedelta(minutes=1),
+                                         sensor_id=self.sensor_b_id)
+
+        status, events = request_json("GET", "/mitigation-events", token=self.admin_token)
+        self.assertEqual(status, 200)
+        # occurred_at desc, ties broken by id desc.
+        self.assertEqual([row["id"] for row in events],
+                         [revert_id, tie_id, other_site_id, apply_id])
+        self.assertEqual(set(events[0]), {
+            "id", "site_id", "sensor_id", "event_type", "original_event_id", "source_ip",
+            "destination_ip", "destination_port", "mse_score", "reason", "occurred_at",
+        })
+        self.assertEqual(events[0]["event_type"], "REVERSION")
+        self.assertEqual(events[0]["original_event_id"], apply_id)
+        self.assertIsNone(events[0]["sensor_id"])
+        self.assertIsNone(events[0]["destination_ip"])
+        self.assertIsNone(events[0]["destination_port"])
+        self.assertIsNone(events[0]["mse_score"])
+        self.assertEqual(events[0]["reason"], "quarantine_timer_elapsed")
+        self.assertEqual(events[3]["destination_port"], 443)
+
+        status, rows = request_json("GET", "/mitigation-events", token=self.admin_token,
+                                    query={"site_id": self.site_a_id, "source_ip": "203.0.113.5"})
+        self.assertEqual(status, 200)
+        self.assertEqual([row["id"] for row in rows], [revert_id, apply_id])
+        status, rows = request_json("GET", "/mitigation-events", token=self.admin_token,
+                                    query={"limit": 2})
+        self.assertEqual([row["id"] for row in rows], [revert_id, tie_id])
+        self.assertEqual(request_json("GET", "/mitigation-events", token=self.admin_token,
+                                      query={"source_ip": "203.0.113.99"})[1], [])
+
+        status, own = request_json("GET", "/mitigation-events", token=self.sensor_token_b)
+        self.assertEqual(status, 200)
+        self.assertEqual([row["id"] for row in own], [other_site_id])
+        self.assertEqual(request_json("GET", "/mitigation-events", token=self.sensor_token_b,
+                                      query={"site_id": self.site_b_id})[0], 200)
+        self.assertEqual(request_json("GET", "/mitigation-events", token=self.sensor_token_b,
+                                      query={"site_id": self.site_a_id})[0], 403)
+
+        self.assertEqual(request_json("GET", "/mitigation-events")[0], 401)
+        for bad in ({"limit": 0}, {"limit": 1001}, {"site_id": 0}, {"source_ip": "not-an-ip"}):
+            self.assertEqual(request_json("GET", "/mitigation-events", token=self.admin_token,
+                                          query=bad)[0], 422, bad)
+        self.assertEqual(request_json("GET", "/mitigation-events", token=self.admin_token,
+                                      query={"limit": 1000})[0], 200)
+        with patch.object(main, "list_mitigation_events", side_effect=SQLAlchemyError("down")):
+            self.assertEqual(request_json("GET", "/mitigation-events",
+                                          token=self.admin_token)[0], 503)
 
     def test_authenticated_ingest_uses_updated_site_threshold_immediately(self) -> None:
         config_path = f"/sites/{self.site_a_id}/config"
