@@ -451,6 +451,60 @@ class Api75Tests(unittest.TestCase):
             self.assertEqual(request_json("GET", "/mitigation-events",
                                           token=self.admin_token)[0], 503)
 
+    def test_quarantines_list_only_live_rows_across_sites(self) -> None:
+        self._seed_quarantine(self.site_a_id, "203.0.113.5")
+        self._seed_quarantine(self.site_b_id, "203.0.113.5")
+        self._seed_quarantine(self.site_b_id, "203.0.113.6")
+        now = datetime.now(timezone.utc)
+        with self.session_factory.begin() as db:
+            db.add(ActiveQuarantine(
+                site_id=self.site_a_id, source_ip="203.0.113.7",
+                destination_ip="198.51.100.8", destination_port=80, mse_score=0.02,
+                quarantined_at=now - timedelta(minutes=30),
+                expires_at=now - timedelta(minutes=1),
+            ))
+            # Newest first; equal timestamps fall back to (site_id, source_ip).
+            for site_id, source_ip, offset in (
+                (self.site_b_id, "203.0.113.6", 1),
+                (self.site_a_id, "203.0.113.5", 0),
+                (self.site_b_id, "203.0.113.5", 0),
+            ):
+                db.execute(update(ActiveQuarantine).where(
+                    ActiveQuarantine.site_id == site_id,
+                    ActiveQuarantine.source_ip == source_ip,
+                ).values(quarantined_at=now + timedelta(minutes=offset)))
+
+        status, rows = request_json("GET", "/quarantines", token=self.admin_token)
+        self.assertEqual(status, 200)
+        self.assertEqual([(row["site_id"], row["source_ip"]) for row in rows], [
+            (self.site_b_id, "203.0.113.6"),
+            (self.site_a_id, "203.0.113.5"),
+            (self.site_b_id, "203.0.113.5"),
+        ])
+        self.assertEqual(set(rows[0]), {
+            "site_id", "source_ip", "destination_ip", "destination_port",
+            "mse_score", "quarantined_at", "expires_at",
+        })
+
+        status, rows = request_json("GET", "/quarantines", token=self.admin_token,
+                                    query={"site_id": self.site_a_id})
+        self.assertEqual([row["source_ip"] for row in rows], ["203.0.113.5"])
+        self.assertEqual(request_json("GET", "/quarantines", token=self.admin_token,
+                                      query={"site_id": 99999})[1], [])
+
+        status, own = request_json("GET", "/quarantines", token=self.sensor_token_a)
+        self.assertEqual(status, 200)
+        self.assertEqual({row["site_id"] for row in own}, {self.site_a_id})
+        self.assertEqual(request_json("GET", "/quarantines", token=self.sensor_token_a,
+                                      query={"site_id": self.site_b_id})[0], 403)
+        self.assertEqual(request_json("GET", "/quarantines")[0], 401)
+        self.assertEqual(request_json("GET", "/quarantines", token=self.admin_token,
+                                      query={"site_id": 0})[0], 422)
+        # The sensor-only dashboard endpoint keeps rejecting the admin token.
+        self.assertEqual(request_json("GET", "/dashboard/state", token=self.admin_token)[0], 401)
+        with patch.object(main, "list_active_quarantines", side_effect=SQLAlchemyError("down")):
+            self.assertEqual(request_json("GET", "/quarantines", token=self.admin_token)[0], 503)
+
     def test_authenticated_ingest_uses_updated_site_threshold_immediately(self) -> None:
         config_path = f"/sites/{self.site_a_id}/config"
         status, _ = request_json(

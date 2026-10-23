@@ -40,6 +40,7 @@ try:
         list_mitigation_events,
         list_alerts,
         find_active_quarantines,
+        list_active_quarantines,
         get_sensor_telemetry,
         get_site_config,
         list_quarantines_for_recovery,
@@ -60,6 +61,7 @@ except ImportError:  # También permite iniciar Uvicorn desde SentinelAI-Backend
         list_mitigation_events,
         list_alerts,
         find_active_quarantines,
+        list_active_quarantines,
         get_sensor_telemetry,
         get_site_config,
         list_quarantines_for_recovery,
@@ -310,6 +312,10 @@ class QuarantineView(BaseModel):
     mse_score: float
     quarantined_at: datetime
     expires_at: datetime
+
+
+class AdminQuarantineView(QuarantineView):
+    site_id: int
 
 
 class CriticalAlertView(BaseModel):
@@ -903,6 +909,21 @@ def dashboard_state(
             for row in alerts
         ],
     )
+
+
+@app.get("/quarantines", response_model=list[AdminQuarantineView], tags=["operations"])
+def get_quarantines(
+    principal: Annotated[AdminIdentity | SensorIdentity, Depends(get_authenticated_reader)],
+    site_id: int | None = Query(default=None, gt=0),
+) -> list[AdminQuarantineView]:
+    """List live quarantines across sites; a sensor may read only its own site's."""
+
+    site_id = _reader_site_scope(principal, site_id, "quarantine")
+    try:
+        rows = list_active_quarantines(site_id)
+    except SQLAlchemyError as exc:
+        raise HTTPException(status_code=503, detail="Quarantine database is unavailable") from exc
+    return [AdminQuarantineView.model_validate(row, from_attributes=True) for row in rows]
 
 
 @app.get("/alerts", response_model=list[AlertView], tags=["operations"])

@@ -337,6 +337,19 @@ def list_current_state(site_id: int) -> tuple[list[ActiveQuarantine], list[Criti
     return quarantines, alerts
 
 
+def list_active_quarantines(site_id: int | None = None) -> list[ActiveQuarantine]:
+    """Return unexpired quarantines for one site or, without a filter, all sites."""
+
+    stmt = select(ActiveQuarantine).where(ActiveQuarantine.expires_at > datetime.now(timezone.utc))
+    if site_id is not None:
+        stmt = stmt.where(ActiveQuarantine.site_id == site_id)
+    with SessionLocal() as db:
+        return list(db.scalars(stmt.order_by(
+            ActiveQuarantine.quarantined_at.desc(), ActiveQuarantine.site_id,
+            ActiveQuarantine.source_ip,
+        )))
+
+
 def list_quarantines_for_recovery() -> list[ActiveQuarantine]:
     """Load pending local firewall releases after an API process restart."""
 
