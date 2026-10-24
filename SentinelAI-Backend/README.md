@@ -44,7 +44,12 @@ Para la presentación completa, [start_demo.sh](../start_demo.sh) realiza los ch
 | --- | --- | --- |
 | `POST /ingest` | Bearer del sensor | MSE, decisión, dispositivo desconocido, mitigación, suspensión y persistencia. |
 | `GET /dashboard/state` | Bearer del sensor | Cuarentenas y alertas críticas vigentes del **mismo sitio**. |
-| `GET /alerts` | Bearer admin o sensor | Alertas recientes; filtros `site_id`, `sensor_id`, `source_ip`, `severity` (`warning`, `high`, `critical`) y `limit`. El sensor sólo ve su sitio. |
+| `GET /alerts` | Bearer admin o sensor | Alertas recientes; filtros `site_id`, `sensor_id`, `source_ip`, `severity` (`warning`, `high`, `critical`), `since`, `until`, `unrecognized_device`, `before_id` y `limit`. El sensor sólo ve su sitio. Detalle en la [guía de la API](../docs/README.md#api-y-observabilidad). |
+| `GET /alerts/{alert_id}` | Bearer admin o sensor | Una alerta; 404 si no existe o es de otro sitio para un sensor. |
+| `GET /sites` | Bearer admin o sensor | Sitios con su configuración; el sensor sólo ve el suyo. |
+| `GET /sites/{site_id}/sensors` | Bearer admin o sensor del sitio | Sensores del sitio con nombre y telemetría. |
+| `GET /mitigation-events` | Bearer admin o sensor | Eventos de firewall, más recientes primero; filtros `site_id`, `source_ip` y `limit` (1–1000). |
+| `GET /quarantines` | Bearer admin o sensor | Cuarentenas vigentes con `site_id`; filtro opcional `site_id`. El sensor sólo ve su sitio. |
 | `GET /sensors/{sensor_id}/telemetry` | Bearer admin o ese sensor | Último heartbeat/ingesta, total de flujos, estado activo y último estado del enlace. |
 | `POST /sensors/{sensor_id}/heartbeat` | Bearer de ese sensor | Registra un heartbeat con `link_degraded`; no incrementa el contador de flujos. |
 | `GET /sites/{site_id}/config` | Bearer admin o sensor del sitio | Umbral, modos de respuesta e inventario conocido. |

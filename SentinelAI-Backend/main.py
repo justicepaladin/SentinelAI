@@ -37,11 +37,16 @@ try:
     from .database import create_database_tables
     from .state_store import (
         list_current_state,
+        list_mitigation_events,
         list_alerts,
         find_active_quarantines,
+        get_alert,
+        list_active_quarantines,
         get_sensor_telemetry,
         get_site_config,
         list_quarantines_for_recovery,
+        list_site_sensors,
+        list_sites,
         record_detection_state,
         release_quarantine_state,
         update_sensor_telemetry,
@@ -54,11 +59,16 @@ except ImportError:  # También permite iniciar Uvicorn desde SentinelAI-Backend
     from database import create_database_tables
     from state_store import (
         list_current_state,
+        list_mitigation_events,
         list_alerts,
         find_active_quarantines,
+        get_alert,
+        list_active_quarantines,
         get_sensor_telemetry,
         get_site_config,
         list_quarantines_for_recovery,
+        list_site_sensors,
+        list_sites,
         record_detection_state,
         release_quarantine_state,
         update_sensor_telemetry,
@@ -222,6 +232,24 @@ class SensorTelemetryView(BaseModel):
     last_link_report_at: datetime | None
 
 
+class SiteSensorView(SensorTelemetryView):
+    name: str
+
+
+class MitigationEventView(BaseModel):
+    id: int
+    site_id: int
+    sensor_id: int | None
+    event_type: Literal["APPLY", "REVERSION", "MANUAL_REVERSION"]
+    original_event_id: int | None
+    source_ip: str
+    destination_ip: str | None
+    destination_port: int | None
+    mse_score: float | None
+    reason: str | None
+    occurred_at: datetime
+
+
 class HeartbeatPayload(BaseModel):
     link_degraded: bool = False
 
@@ -232,6 +260,14 @@ class SiteConfigView(BaseModel):
     active_response_enabled: bool
     informative_only_mode: bool
     known_devices: list[str]
+
+
+class SiteView(BaseModel):
+    id: int
+    slug: str
+    name: str
+    is_active: bool
+    config: SiteConfigView
 
 
 class SiteConfigUpdate(BaseModel):
@@ -278,6 +314,10 @@ class QuarantineView(BaseModel):
     mse_score: float
     quarantined_at: datetime
     expires_at: datetime
+
+
+class AdminQuarantineView(QuarantineView):
+    site_id: int
 
 
 class CriticalAlertView(BaseModel):
@@ -873,6 +913,21 @@ def dashboard_state(
     )
 
 
+@app.get("/quarantines", response_model=list[AdminQuarantineView], tags=["operations"])
+def get_quarantines(
+    principal: Annotated[AdminIdentity | SensorIdentity, Depends(get_authenticated_reader)],
+    site_id: int | None = Query(default=None, gt=0),
+) -> list[AdminQuarantineView]:
+    """List live quarantines across sites; a sensor may read only its own site's."""
+
+    site_id = _reader_site_scope(principal, site_id, "quarantine")
+    try:
+        rows = list_active_quarantines(site_id)
+    except SQLAlchemyError as exc:
+        raise HTTPException(status_code=503, detail="Quarantine database is unavailable") from exc
+    return [AdminQuarantineView.model_validate(row, from_attributes=True) for row in rows]
+
+
 @app.get("/alerts", response_model=list[AlertView], tags=["operations"])
 def get_alerts(
     principal: Annotated[AdminIdentity | SensorIdentity, Depends(get_authenticated_reader)],
@@ -880,9 +935,21 @@ def get_alerts(
     sensor_id: int | None = Query(default=None, gt=0),
     source_ip: IPvAnyAddress | None = None,
     severity: Literal["warning", "high", "critical"] | None = None,
+    since: datetime | None = None,
+    until: datetime | None = None,
+    unrecognized_device: bool | None = None,
+    before_id: int | None = Query(default=None, gt=0),
     limit: int = Query(default=100, ge=1, le=1000),
 ) -> list[AlertView]:
-    """List recent alerts; a sensor may read only its own site's alerts."""
+    """List recent alerts; a sensor may read only its own site's alerts.
+
+    ``since`` is inclusive and ``until`` exclusive (naive values are UTC);
+    ``before_id`` returns only alerts with a smaller id, to page backwards.
+    """
+
+    since, until = _as_utc(since), _as_utc(until)
+    if since is not None and until is not None and since >= until:
+        raise HTTPException(status_code=422, detail="since must be earlier than until")
 
     if isinstance(principal, SensorIdentity):
         if site_id is not None and site_id != principal.site_id:
@@ -891,10 +958,80 @@ def get_alerts(
     try:
         rows = list_alerts(site_id=site_id, sensor_id=sensor_id,
                            source_ip=str(source_ip) if source_ip is not None else None,
-                           severity=severity, limit=limit)
+                           severity=severity, limit=limit, since=since, until=until,
+                           unrecognized_device=unrecognized_device, before_id=before_id)
     except SQLAlchemyError as exc:
         raise HTTPException(status_code=503, detail="Alert database is unavailable") from exc
     return [AlertView.model_validate(row, from_attributes=True) for row in rows]
+
+
+def _telemetry_fields(sensor: Any, telemetry: Any) -> dict[str, Any]:
+    """Telemetry projection with the defaults used before a sensor reports."""
+
+    return dict(
+        sensor_id=sensor.id, site_id=sensor.site_id, is_active=sensor.is_active,
+        last_heartbeat_at=telemetry.last_heartbeat_at if telemetry else None,
+        last_ingest_at=telemetry.last_ingest_at if telemetry else None,
+        flow_count=telemetry.flow_count if telemetry else 0,
+        last_link_degraded=telemetry.last_link_degraded if telemetry else False,
+        last_link_report_at=telemetry.last_link_report_at if telemetry else None,
+    )
+
+
+def _as_utc(value: datetime | None) -> datetime | None:
+    """Interpret naive timestamps as UTC and normalize offsets for comparison."""
+
+    if value is None:
+        return None
+    return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+
+
+def _reader_site_scope(
+    principal: AdminIdentity | SensorIdentity, site_id: int | None, resource: str,
+) -> int | None:
+    """Admins keep the requested site filter; a sensor is pinned to its own site."""
+
+    if isinstance(principal, SensorIdentity):
+        if site_id is not None and site_id != principal.site_id:
+            raise HTTPException(status_code=403, detail=f"Cross-site {resource} access is forbidden")
+        return principal.site_id
+    return site_id
+
+
+@app.get("/mitigation-events", response_model=list[MitigationEventView], tags=["operations"])
+def get_mitigation_events(
+    principal: Annotated[AdminIdentity | SensorIdentity, Depends(get_authenticated_reader)],
+    site_id: int | None = Query(default=None, gt=0),
+    source_ip: IPvAnyAddress | None = None,
+    limit: int = Query(default=100, ge=1, le=1000),
+) -> list[MitigationEventView]:
+    """List firewall events, newest first; a sensor may read only its own site's."""
+
+    site_id = _reader_site_scope(principal, site_id, "mitigation event")
+    try:
+        rows = list_mitigation_events(
+            site_id=site_id, source_ip=str(source_ip) if source_ip is not None else None,
+            limit=limit,
+        )
+    except SQLAlchemyError as exc:
+        raise HTTPException(status_code=503, detail="Mitigation event database is unavailable") from exc
+    return [MitigationEventView.model_validate(row, from_attributes=True) for row in rows]
+
+
+@app.get("/alerts/{alert_id}", response_model=AlertView, tags=["operations"])
+def get_alert_detail(
+    alert_id: int,
+    principal: Annotated[AdminIdentity | SensorIdentity, Depends(get_authenticated_reader)],
+) -> AlertView:
+    """Read one alert; other sites' alerts look nonexistent to a sensor."""
+
+    try:
+        row = get_alert(alert_id)
+    except SQLAlchemyError as exc:
+        raise HTTPException(status_code=503, detail="Alert database is unavailable") from exc
+    if row is None or (isinstance(principal, SensorIdentity) and row.site_id != principal.site_id):
+        raise HTTPException(status_code=404, detail="Alert not found")
+    return AlertView.model_validate(row, from_attributes=True)
 
 
 @app.get("/sensors/{sensor_id}/telemetry", response_model=SensorTelemetryView,
@@ -912,14 +1049,7 @@ def sensor_telemetry(
     if result is None:
         raise HTTPException(status_code=404, detail="Sensor not found")
     sensor, telemetry = result
-    return SensorTelemetryView(
-        sensor_id=sensor.id, site_id=sensor.site_id, is_active=sensor.is_active,
-        last_heartbeat_at=telemetry.last_heartbeat_at if telemetry else None,
-        last_ingest_at=telemetry.last_ingest_at if telemetry else None,
-        flow_count=telemetry.flow_count if telemetry else 0,
-        last_link_degraded=telemetry.last_link_degraded if telemetry else False,
-        last_link_report_at=telemetry.last_link_report_at if telemetry else None,
-    )
+    return SensorTelemetryView(**_telemetry_fields(sensor, telemetry))
 
 
 @app.post("/sensors/{sensor_id}/heartbeat", response_model=SensorTelemetryView,
@@ -957,6 +1087,42 @@ def _config_view(site_id: int, config: Any) -> SiteConfigView:
         informative_only_mode=bool(config.informative_only_mode) if config else True,
         known_devices=list(config.known_devices or ()) if config else [],
     )
+
+
+@app.get("/sites", response_model=list[SiteView], tags=["operations"])
+def get_sites(
+    principal: Annotated[AdminIdentity | SensorIdentity, Depends(get_authenticated_reader)],
+) -> list[SiteView]:
+    """List sites with their configuration; a sensor sees only its own site."""
+
+    try:
+        rows = list_sites(principal.site_id if isinstance(principal, SensorIdentity) else None)
+    except SQLAlchemyError as exc:
+        raise HTTPException(status_code=503, detail="Site database is unavailable") from exc
+    return [
+        SiteView(id=site.id, slug=site.slug, name=site.name, is_active=site.is_active,
+                 config=_config_view(site.id, config))
+        for site, config in rows
+    ]
+
+
+@app.get("/sites/{site_id}/sensors", response_model=list[SiteSensorView], tags=["operations"])
+def site_sensors(
+    site_id: int,
+    principal: Annotated[AdminIdentity | SensorIdentity, Depends(get_authenticated_reader)],
+) -> list[SiteSensorView]:
+    """List a site's sensors with telemetry; a sensor may read only its own site."""
+
+    if isinstance(principal, SensorIdentity) and principal.site_id != site_id:
+        raise HTTPException(status_code=403, detail="Cross-site sensor access is forbidden")
+    try:
+        rows = list_site_sensors(site_id)
+    except SQLAlchemyError as exc:
+        raise HTTPException(status_code=503, detail="Telemetry database is unavailable") from exc
+    if rows is None:
+        raise HTTPException(status_code=404, detail="Site not found")
+    return [SiteSensorView(name=sensor.name, **_telemetry_fields(sensor, telemetry))
+            for sensor, telemetry in rows]
 
 
 @app.get("/sites/{site_id}/config", response_model=SiteConfigView, tags=["operations"])
