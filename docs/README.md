@@ -43,6 +43,7 @@ El replay usa datos ya procesados de CIC-IDS2017. No captura paquetes de red en 
 | `scripts/archive_logs.py` | Archivo de logs antiguos para cron. |
 | `docker-compose.yml` | Laboratorio opcional con un servidor Nginx `victima` y un contenedor Alpine `cliente`. |
 | `start_demo.sh` | Orquestador de cuatro terminales y consola interactiva para demostrar el avance del 75 %. |
+| `setup_and_run_demo.sh` | Preparación destructiva y autocontenida: limpia datos, rota credenciales y ejecuta API más replay. |
 
 ## 3. Preparación y ejecución de la demo
 
@@ -73,7 +74,7 @@ docker start sentinel-postgres 2>/dev/null || docker run -d \
   -e POSTGRES_USER=sentinel_user \
   -e POSTGRES_PASSWORD=sentinel_password \
   -e POSTGRES_DB=sentinel_db \
-  -p 5432:5432 postgres:15
+  -p 127.0.0.1:5432:5432 postgres:15
 ```
 
 Si se usa ese contenedor, configurar en `SentinelAI-Backend/.env`:
@@ -117,6 +118,18 @@ Pegar en la lectura silenciosa sólo el valor del token emitido, sin el prefijo 
 `integracion_sensor.py` separa la fuente de flujos del envío: `send_flows(flows, session=..., api_url=..., token=...)` consume cualquier iterable de diccionarios entregado por un extractor y publica cada flujo directamente desde memoria. No necesita crear un CSV intermedio. `iter_csv_flows(path, chunk_size=512)` sirve como adaptador para una demo con CSV: lee por bloques y entrega las filas en una sola pasada. Esto evita cargar el archivo completo en ese sensor; `demo_replay.py` sigue siendo una demo separada que selecciona 100 filas de un CSV.
 
 El sensor usa `SENTINEL_SENSOR_TOKEN` para enviar `Authorization: Bearer <token>`; el backend obtiene el sensor y el sitio desde ese token. El Edge no envía `site_id` como dato confiable. Puede agregar `link_degraded` al flujo cuando su monitor de enlace detecte degradación. `SENTINEL_API_URL`, `SENTINEL_CSV_FILE`, `SENTINEL_CSV_CHUNK_SIZE` y `SENTINEL_FLOW_DELAY` controlan el replay por bloques; `SENTINEL_REPLAY_CSV_FILE` cambia el CSV de `demo_replay.py`.
+
+### Preparación automática de una demo descartable
+
+Para reiniciar por completo la demo local, aprovisionar sus credenciales y ejecutar API más replay en una sola terminal:
+
+```bash
+./setup_and_run_demo.sh
+```
+
+Este flujo es **destructivo**: sobre `sentinel-postgres` deshabilita temporalmente el trigger inmutable, ejecuta `TRUNCATE sites RESTART IDENTITY CASCADE` dentro de una transacción y vuelve a habilitarlo. Luego crea el sitio `deposito-central` con nombre “Depósito Central” y el sensor `Replay-Edge`, exporta su token sólo a los procesos que lo necesitan, genera un `TOKEN_ADMIN` nuevo y guarda únicamente su SHA-256 en `SentinelAI-Backend/.env`. El token claro aparece en un recuadro para copiarlo.
+
+Antes de borrar datos, el script comprueba que `DATABASE_URL` sea la conexión local a ese mismo contenedor y que no haya otra API SentinelAI activa. Los contenedores nuevos publican PostgreSQL sólo en `127.0.0.1`; un contenedor heredado publicado en `0.0.0.0` se reutiliza sin destruirlo, mostrando una advertencia para que el operador restrinja el puerto después. El script espera que PostgreSQL y los tres indicadores de `/health` estén listos, verifica por telemetría que se registraron los 100 flujos y mantiene Uvicorn abierto hasta `Ctrl+C`. Requiere el entorno virtual, el modelo, el scaler y el CSV indicados en los requisitos anteriores.
 
 ### Orquestador completo de la demo del 75 %
 

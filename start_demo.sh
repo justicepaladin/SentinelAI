@@ -209,7 +209,7 @@ start_postgres() {
             -e POSTGRES_USER=sentinel_user \
             -e POSTGRES_PASSWORD=sentinel_password \
             -e POSTGRES_DB=sentinel_db \
-            -p 5432:5432 postgres:15 >/dev/null
+            -p 127.0.0.1:5432:5432 postgres:15 >/dev/null
     fi
 
     local attempt

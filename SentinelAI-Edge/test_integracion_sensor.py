@@ -5,7 +5,7 @@ from __future__ import annotations
 import io
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -117,11 +117,32 @@ class EdgePipelineTests(unittest.TestCase):
         ), patch.object(demo_replay.requests, "Session", return_value=session), patch.object(
             demo_replay.time, "sleep"
         ), redirect_stdout(io.StringIO()):
-            demo_replay.main()
+            result = demo_replay.main()
 
+        self.assertEqual(result, 0)
         self.assertEqual(len(session.calls), 100)
         self.assertTrue(all(call[1]["headers"] == {"Authorization": "Bearer sensor-secret"} for call in session.calls))
         self.assertTrue(all("Label" not in call[1]["json"]["features"] for call in session.calls))
+
+    def test_demo_replay_returns_failure_when_api_rejects_flows(self):
+        dataframe = pd.DataFrame(
+            {
+                "Label": ["BENIGN"] * 80 + ["DoS Hulk"] * 20,
+                "Flow Duration": [1] * 100,
+            }
+        )
+        session = FakeSession()
+        with patch.dict("os.environ", {"SENTINEL_SENSOR_TOKEN": "sensor-secret"}), patch.object(
+            demo_replay.pd, "read_csv", return_value=dataframe
+        ), patch.object(demo_replay.requests, "Session", return_value=session), patch.object(
+            demo_replay.time, "sleep"
+        ), patch.object(FakeResponse, "status_code", 503), redirect_stdout(
+            io.StringIO()
+        ), redirect_stderr(io.StringIO()):
+            result = demo_replay.main()
+
+        self.assertEqual(result, 1)
+        self.assertEqual(len(session.calls), 100)
 
 
 if __name__ == "__main__":

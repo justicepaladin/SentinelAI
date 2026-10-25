@@ -23,12 +23,12 @@ CSV_FILE = Path(
 ).expanduser()
 
 
-def main():
+def main() -> int:
     try:
         headers = sensor_headers()
     except ValueError as exc:
         print(f"[!] {exc}", file=sys.stderr)
-        sys.exit(1)
+        return 1
 
     print("[*] Cargando dataset para el Replay (Nivel 1)...")
     try:
@@ -38,7 +38,7 @@ def main():
     except FileNotFoundError:
         print(f"[!] Error: No se encontró el archivo {CSV_FILE}")
         print("[!] Configurá SENTINEL_REPLAY_CSV_FILE con un CSV válido.")
-        sys.exit(1)
+        return 1
 
     # Filtramos para tener una muestra desbalanceada realista (80 benignos, 20 ataques)
     try:
@@ -48,11 +48,12 @@ def main():
         muestra = pd.concat([benignos, maliciosos]).sample(frac=1).reset_index(drop=True)
     except KeyError:
         print("[!] Error: No se encontró la columna 'Label'.")
-        sys.exit(1)
+        return 1
 
     print("[+] Dataset preparado. Iniciando inyección de 100 flujos...")
     print("-" * 85)
 
+    failures = 0
     with requests.Session() as session:
         for index, fila in muestra.iterrows():
             etiqueta_real = fila['Label']
@@ -91,12 +92,23 @@ def main():
                     print(f"[{index+1:03d}] REAL: {etiqueta_real:<15} | IA: {marca_ia:<20} | MSE: {mse:.6f}")
                 else:
                     print(f"[-] Error HTTP {r.status_code}: {r.text}")
+                    failures += 1
             except (requests.RequestException, TypeError, ValueError) as exc:
                 print(f"[-] Error enviando el flujo {index}: {exc}")
+                failures += 1
 
             # Pausa de presentación; el envío en vivo no la necesita.
             time.sleep(0.3)
 
+    if failures:
+        print(
+            f"[!] Replay incompleto: {failures} de 100 flujos no fueron aceptados.",
+            file=sys.stderr,
+        )
+        return 1
+    print("[+] Replay completo: los 100 flujos fueron aceptados por la API.")
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

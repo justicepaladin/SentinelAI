@@ -16,6 +16,7 @@ La [documentación completa](docs/README.md) incluye arquitectura, instalación,
 - [`scripts/benchmark_rnf.py`](scripts/benchmark_rnf.py): medición local de inferencia y `/ingest` con pruebas RNF-05/06.
 - [`SentinelAI-Model/threshold_analysis.py`](SentinelAI-Model/threshold_analysis.py): normalidad y FPR/F1 para cuatro alternativas de umbral.
 - [`start_demo.sh`](start_demo.sh): inicia PostgreSQL, abre Backend/Edge/firewall y ofrece una consola para recorrer las funciones del 75 %.
+- [`setup_and_run_demo.sh`](setup_and_run_demo.sh): reinicia los datos de la demo, aprovisiona sus credenciales y ejecuta Uvicorn más el replay en un solo flujo.
 - [`docker-compose.yml`](docker-compose.yml): cliente y víctima de la demo de nivel 2.
 
 Los CSV y el archivo `sentinel_model.h5` se mantienen fuera de Git; deben estar disponibles localmente para repetir inferencia y evaluación.
@@ -31,6 +32,14 @@ export TOKEN_ADMIN='<token administrador sin hashear>'
 ```
 
 El procedimiento inicial, el contenido de cada terminal y el recorrido sugerido están en la [guía completa](docs/README.md).
+
+Para preparar una demo descartable desde cero y ejecutarla sin copiar tokens a mano:
+
+```bash
+./setup_and_run_demo.sh
+```
+
+**Advertencia:** este lanzador trunca todos los datos de SentinelAI en `sentinel-postgres` y rota el token administrador de `SentinelAI-Backend/.env`. Muestra el nuevo `TOKEN_ADMIN` para copiar, ejecuta los 100 flujos y mantiene Uvicorn activo hasta recibir `Ctrl+C`. Antes de modificar la base valida que `DATABASE_URL` apunte al contenedor local esperado.
 
 ### Obtención de Datasets (Validación y Replay)
 Para reproducir las simulaciones y las evaluaciones de generalización (OOD), el sistema requiere los archivos CSV originales. Por cuestiones de tamaño y licencias, no están incluidos en este repositorio.
