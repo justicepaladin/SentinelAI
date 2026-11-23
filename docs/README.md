@@ -232,7 +232,7 @@ La respuesta normal tiene HTTP 200. `dashboard_state_persisted` vale `true` cuan
 | RNF-05 | Un flujo con `link_degraded=true` suspende `iptables`; si omite el campo, se usa un reporte explícito reciente del sensor durante 120 s por defecto. La detección y la alerta siguen activas. |
 | RF-09 | Una IP fuente RFC1918/ULA ausente del inventario genera `unrecognized_device=true` en respuesta y log, y una alerta de severidad `warning` si no había anomalía. |
 | RNF-03, RNF-05, RNF-06 | [Benchmark medido](benchmark_rnf_results.md) con 500 peticiones y [CSV](benchmark_rnf_results.csv); usa modelo y scaler reales, con firewall y persistencia simulados en memoria. |
-| Objeción estadística | [Normalidad, FPR y F1 por umbral](threshold_justification.md), medidos con los CSV locales completos. |
+| Objeción estadística | Sensibilidad, precisión y FPR para alertas y bloqueos simulados, por archivo y por familia de ataque. [Evaluación de umbrales](threshold_justification.md) |
 
 `PUT /sites/{site_id}/config` y la reversión manual usan un token administrador separado, cuyo SHA-256 hexadecimal se guarda en `SENTINEL_ADMIN_TOKEN_SHA256` en el `.env` del backend. Las consultas de alertas, sitios, sensores, eventos de mitigación, cuarentenas y configuración aceptan ese token o el de un sensor del mismo sitio; con el token de sensor sólo devuelven datos de su sitio. Todas responden 401 sin token válido, 422 ante parámetros inválidos y 503 si PostgreSQL no está disponible. La telemetría de un sensor sólo puede leerla el administrador o ese sensor. La [guía del backend](../SentinelAI-Backend/README.md) incluye contratos y ejemplo de configuración.
 
@@ -375,7 +375,7 @@ El validador informa, por conjunto y en agregado, soporte de ambas clases, preci
 
 **Compatibilidad de dominios:** CIC-IDS2017 y UNSW-NB15 no comparten de forma directa las 78 variables de entrada del artefacto actual. La evaluación externa sólo es válida si se proporciona una transformación reproducible que produzca exactamente las variables del scaler, con mismas unidades y semántica. Rellenar columnas ausentes con ceros o renombrarlas por posición fabricaría un resultado. Si no se dispone de esa correspondencia, el informe debe indicar que UNSW-NB15 no pudo evaluarse en condiciones comparables.
 
-### Resultado medido en los CSV locales completos
+### Referencia con el umbral desplegado en los CSV completos
 
 Se ejecutó `evaluate_ood.py` con el modelo y scaler locales, `--sample-fraction 1.0` y el umbral congelado `0.000308`. De 2.300.825 filas de los siete CSV de martes a viernes, 2.430 tenían entradas inválidas y se evaluaron **2.298.395**. El lunes quedó fuera porque participó del entrenamiento. La tabla resume las matrices de confusión completas; TN/FP/FN/TP usan el orden definido arriba.
 
@@ -390,13 +390,17 @@ Se ejecutó `evaluate_ood.py` con el modelo y scaler locales, `--sample-fraction
 | Viernes, PortScan | 286.096 | 125.602 | 1.690 | 127.302 | 31.502 | 0,3282 |
 | **Agregado de días no vistos** | **2.298.395** | **1.667.975** | **73.864** | **284.017** | **272.539** | **0,6037** |
 
-La figura compara las matrices obtenidas de los siete CSV locales de CIC-IDS2017 reservados para evaluación:
-
-![Matrices de confusión por día](confusion_matrices.png)
-
 En el agregado, la precisión fue **0,7868** y el recall **0,4897**. El F1 de **0,97** comunicado para la muestra acotada de la entrega anterior no se reprodujo al evaluar todos los flujos: incluso el miércoles completo dio **0,7752**. El comportamiento depende mucho del tipo de tráfico: el martes detectó 9 de 13.832 ataques; en el jueves de Infiltration sólo había 36 ataques y hubo 26.959 falsos positivos, de modo que ese F1 requiere leer también el soporte y la matriz. Estos resultados muestran una limitación real de generalización de los artefactos y umbral actuales; por sí solos no identifican una única causa, como sobreajuste, deriva de distribución o diferencias de clases.
 
-Los valores exactos y parámetros de la corrida están en `SentinelAI-Model/reports/ood-full/`: `metrics.csv`, `confusion_matrices.csv`, `confusion_matrices.png` y `evaluation.json`. Ese directorio está ignorado por Git y debe conservarse aparte o regenerarse con los datos y artefactos correspondientes; una copia de la figura quedó en `docs/confusion_matrices.png`. No se reporta un F1 de UNSW-NB15: en este workspace no hay un CSV externo con las 78 características equivalentes, y el formato tabular original no es compatible.
+Los valores exactos y parámetros de esta corrida se guardaron en el directorio local `SentinelAI-Model/reports/ood-full/`. La evaluación externa con UNSW-NB15 queda pendiente de disponer de flujos compatibles con las 78 características del modelo.
+
+### Alertas informativas y bloqueo crítico simulado
+
+Con P90, las alertas detectaron 387.873 de 556.556 ataques (69,69 %) y alcanzaron a 270.370 de 1.741.839 flujos benignos (15,52 %). La figura muestra las matrices para este umbral de alerta.
+
+En la simulación, 47.053 de esas 270.370 falsas alertas escalarían a bloqueo con P99.9 (17,40 %). Eso equivale al 2,70 % de todos los flujos benignos. La FPR crítica llegó al 22,75 % en el archivo DDoS del viernes (22.226 de 97.686 benignos). La cifra agregada oculta esa variación entre archivos. La comparación completa y el comando para reproducir la figura están en el [informe de umbrales](threshold_justification.md).
+
+![Matrices de confusión del umbral de alerta P90 sobre los siete archivos de evaluación](confusion_matrices.png)
 
 ## 6. Variables y artefactos
 

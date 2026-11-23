@@ -9,7 +9,7 @@ de preparación y ejecución está en el [`README` principal](../README.md).
 `evaluate_ood.py` evalúa el **modelo y scaler ya entrenados**, sin volver a
 ajustarlos. Lee los CSV por bloques, transforma las 78 columnas en el orden de
 `scaler.feature_names_in_`, descarta flujos con valores no numéricos o infinitos
-y aplica el umbral MSE fijo `0.000308` que usa el backend. Cada archivo produce
+y aplica por defecto el umbral MSE `0.000308` que usa el backend. Cada archivo produce
 TN, FP, FN, TP, precisión, recall, F1 y tasa de falsos positivos. También
 produce un agregado de los días de CIC que no participaron en el entrenamiento.
 Cuando un archivo no contiene ataques evaluables, recall y F1 quedan vacíos
@@ -48,8 +48,13 @@ python SentinelAI-Model/evaluate_ood.py \
 El evaluador recorre todos los `*.csv` de `--cic-dir`, omite el lunes y prueba
 martes a viernes. `--sample-fraction 0.02 --seed 42` acelera una exploración
 reproducible, pero los resultados finales deben usar todas las filas. Se puede
-pasar `--model`, `--scaler` y `--threshold` para probar otros artefactos; el
-umbral debe quedar fijado **antes** de mirar los días de prueba.
+pasar `--model` y `--scaler` para evaluar otros artefactos. `--threshold` fija
+el umbral de alerta que se usa en las matrices. Con `--critical-threshold` se
+simula el bloqueo de los flujos cuyo MSE alcanza ese segundo umbral, que debe
+ser mayor que el de alerta. El resumen distingue el porcentaje de ataques que
+alcanzan el nivel crítico, el de benignos que lo alcanzan (FPR crítica) y el de
+falsas alertas que escalarían. `--plot-path docs/confusion_matrices.png` permite
+elegir el destino de la figura y conservar los CSV y JSON en `--output-dir`.
 
 ### Prueba externa con UNSW-NB15
 
@@ -107,13 +112,17 @@ python -m unittest discover -s SentinelAI-Model/tests -v
 
 ## Comparación estadística de umbrales
 
-`threshold_analysis.py` calcula los MSE benignos del lunes con el modelo y
-scaler congelados, aplica D'Agostino-Pearson K², informa asimetría y curtosis,
-y compara `μ + 3σ`, el `τ = 0.000308` desplegado, P99 recalculado, P99.5 y
-P99.9. Las tasas FPR y F1 se miden sobre martes a viernes. El lunes **ya fue
-usado para entrenar** el modelo y ajustar el scaler, así que esta calibración
-es dentro de muestra; el reporte identifica esa limitación y no presenta el
-P99 como garantía de FPR fuera de muestra.
+`threshold_analysis.py` calcula los percentiles P80, P85, P90, P95, P97, P98,
+P99, P99.5 y P99.9 y la regla `μ + 3σ` sobre el MSE benigno del lunes. Mide
+recall, precisión, FPR y F1 en los siete archivos de martes a viernes, e incluye
+el umbral desplegado como referencia. Para el bloqueo evalúa P99.5, P99.9,
+`μ + 3σ` y el triple de P90, P95 y P97. El lunes también se usó para entrenar
+el modelo y ajustar el scaler, por lo que la FPR fuera de muestra se estima
+con los benignos de los días restantes.
+
+El informe incluye resultados por archivo y familia de ataque, la precisión
+esperada a cuatro prevalencias y el comando para reproducir la figura de
+alerta P90 con el resumen de bloqueo P99.9. [Informe de umbrales](../docs/threshold_justification.md)
 
 ```bash
 python SentinelAI-Model/threshold_analysis.py \

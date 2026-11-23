@@ -1,8 +1,9 @@
 """Compare normal-theory and empirical MSE thresholds without test-set leakage.
 
 The frozen model and scaler reconstruct benign Monday CIC-IDS2017 flows to
-calibrate candidate thresholds. Tuesday--Friday are used only to measure FPR
-and F1. Monday is *not* an independent calibration set for these artifacts:
+calibrate candidate thresholds. Tuesday--Friday measure detection and false
+positives for informative alerts and critical blocks. Monday is *not* an
+independent calibration set for these artifacts:
 it was used to fit both of them in the original notebook. Run ``--help`` for
 the reproducible command and sampling options.
 """
@@ -12,7 +13,8 @@ from __future__ import annotations
 import argparse
 import hashlib
 import math
-from dataclasses import dataclass
+import shlex
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -25,6 +27,9 @@ from evaluate_ood import DEPLOYED_THRESHOLD, feature_sources, load_assets, parse
 
 HERE = Path(__file__).resolve().parent
 DEFAULT_REPORT = HERE.parent / "docs" / "threshold_justification.md"
+PERCENTILES = (80, 85, 90, 95, 97, 98, 99, 99.5, 99.9)
+DETAIL_METHODS = ("P90", "P95", "P97", "P99 recalculado")
+PREVALENCES = (0.242, 0.10, 0.01, 0.001)
 
 
 @dataclass
@@ -41,6 +46,17 @@ class FileCounts:
             setattr(self, field, getattr(self, field) + getattr(other, field))
 
 
+@dataclass
+class GroupCounts:
+    flows: int = 0
+    alerts: dict[str, int] = field(default_factory=dict)
+
+    def add(self, mse: np.ndarray, thresholds: dict[str, float]) -> None:
+        self.flows += len(mse)
+        for name, threshold in thresholds.items():
+            self.alerts[name] = self.alerts.get(name, 0) + int(np.count_nonzero(mse > threshold))
+
+
 def _file_seed(path: Path, seed: int) -> int:
     return seed ^ int.from_bytes(
         hashlib.sha256(path.name.encode("utf-8")).digest()[:8], "little"
@@ -51,8 +67,8 @@ def iter_reconstruction_errors(
     path: Path, *, model: Any, scaler: Any, features: list[str],
     chunksize: int, batch_size: int, sample_fraction: float, seed: int,
     counts: FileCounts,
-) -> Iterator[tuple[np.ndarray, np.ndarray]]:
-    """Yield (MSE, attack label) using the same preprocessing as evaluate_ood."""
+) -> Iterator[tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    """Yield valid MSE, binary labels and CIC attack names in the same row order."""
     rng = np.random.default_rng(_file_seed(path, seed))
     schema_checked = False
     with pd.read_csv(path, chunksize=chunksize, low_memory=False) as reader:
@@ -91,7 +107,9 @@ def iter_reconstruction_errors(
             counts.evaluated_rows += len(mse)
             counts.benign_rows += int((labels == 0).sum())
             counts.attack_rows += int((labels == 1).sum())
-            yield mse.astype(np.float64), labels
+            groups = chunk.loc[valid, "Label"].astype("string").str.strip().to_numpy(dtype=str)
+            groups[labels == 0] = "BENIGN"
+            yield mse.astype(np.float64), labels, groups
 
 
 def describe_calibration(benign_mse: np.ndarray) -> dict[str, float]:
@@ -116,18 +134,28 @@ def describe_calibration(benign_mse: np.ndarray) -> dict[str, float]:
 def candidate_thresholds(benign_mse: np.ndarray) -> list[tuple[str, float]]:
     """Calibrate alternatives from Monday only; keep deployed tau frozen."""
     summary = describe_calibration(benign_mse)
+    values = np.percentile(benign_mse, PERCENTILES, method="linear")
     return [
+        ("P99 recalculado" if p == 99 else f"P{p}", float(value))
+        for p, value in zip(PERCENTILES, values)
+    ] + [
         ("μ + 3σ", summary["mean"] + 3 * summary["std_population"]),
         ("P99 desplegado", DEPLOYED_THRESHOLD),
-        ("P99 recalculado", float(np.percentile(benign_mse, 99, method="linear"))),
-        ("P99.5", float(np.percentile(benign_mse, 99.5, method="linear"))),
-        ("P99.9", float(np.percentile(benign_mse, 99.9, method="linear"))),
     ]
 
 
-def confusion_counts(mse: np.ndarray, labels: np.ndarray, threshold: float) -> tuple[int, int, int, int]:
-    """Return TN, FP, FN, TP; anomaly is strictly MSE > threshold."""
-    predicted = mse > threshold
+def critical_thresholds(candidates: dict[str, float]) -> dict[str, float]:
+    return {
+        **{name: candidates[name] for name in ("P99.5", "P99.9", "μ + 3σ")},
+        **{f"3 × {name}": 3 * candidates[name] for name in ("P90", "P95", "P97")},
+    }
+
+
+def confusion_counts(
+    mse: np.ndarray, labels: np.ndarray, threshold: float, *, inclusive: bool = False,
+) -> tuple[int, int, int, int]:
+    """Return TN, FP, FN, TP for a strict alert or inclusive critical cutoff."""
+    predicted = mse >= threshold if inclusive else mse > threshold
     attack = labels == 1
     return (
         int((~attack & ~predicted).sum()),
@@ -148,6 +176,14 @@ def classification_metrics(counts: tuple[int, int, int, int]) -> dict[str, float
     }
 
 
+def expected_precision(recall: float | None, fpr: float | None, prevalence: float) -> float | None:
+    if recall is None or fpr is None:
+        return None
+    true_alerts = recall * prevalence
+    all_alerts = true_alerts + fpr * (1 - prevalence)
+    return true_alerts / all_alerts if all_alerts else None
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -164,122 +200,235 @@ def _fmt_metric(value: float | None) -> str:
     return "N/D" if value is None else f"{value:.4f}"
 
 
+def _fmt_pct(value: float | None) -> str:
+    return "N/D" if value is None else f"{100 * value:.2f}"
+
+
+def _score_table(thresholds: dict[str, float], metrics: dict[str, dict[str, Any]]) -> list[str]:
+    lines = [
+        "| Método | Umbral MSE | TN | FP | FN | TP | Sensibilidad (Recall) | Precisión | FPR (%) | F1 |",
+        "| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+    ]
+    for name, threshold in thresholds.items():
+        m = metrics[name]
+        lines.append(
+            f"| {name} | {threshold:.9g} | {m['tn']:,} | {m['fp']:,} | {m['fn']:,} | "
+            f"{m['tp']:,} | {_fmt_metric(m['recall'])} | {_fmt_metric(m['precision'])} | "
+            f"{_fmt_pct(m['fpr'])} | {_fmt_metric(m['f1'])} |"
+        )
+    return lines
+
+
+def _cli_path(path: Path) -> str:
+    resolved = path.resolve()
+    if resolved.is_relative_to(HERE.parent):
+        resolved = resolved.relative_to(HERE.parent)
+    return shlex.quote(str(resolved))
+
+
 def render_report(
-    *, calibration: dict[str, float], rows: list[dict[str, Any]],
-    monday: Path, holdouts: list[Path], calibration_counts: FileCounts,
-    evaluation_counts: FileCounts, model_path: Path, scaler_path: Path,
-    calibration_fraction: float, evaluation_fraction: float, seed: int,
+    *, calibration: dict[str, float], candidates: dict[str, float], critical: dict[str, float],
+    alert_metrics: dict[str, dict[str, Any]], critical_metrics: dict[str, dict[str, Any]],
+    monday: Path, breakdown: dict[Path, dict[str, GroupCounts]], calibration_counts: FileCounts,
+    evaluation_counts: FileCounts, args: argparse.Namespace,
 ) -> str:
     reject = calibration["normaltest_p"] < 0.05
+    alert = alert_metrics["P90"]
+    block = critical_metrics["P99.9"]
+    reference = alert_metrics["P99 desplegado"]
+    prevalence = evaluation_counts.attack_rows / evaluation_counts.evaluated_rows
+    p99 = candidates["P99 recalculado"]
+    rounding = (
+        " A seis decimales reproduce el umbral histórico redondeado del notebook."
+        if round(p99, 6) == DEPLOYED_THRESHOLD else ""
+    )
     lines = [
-        "# Justificación estadística del umbral de MSE",
+        "# Sensibilidad de las alertas y falsos positivos del bloqueo crítico",
         "",
-        "## Diseño y procedencia",
+        "## Diseño de la evaluación",
         "",
-        "Se reconstruyeron los flujos CIC-IDS2017 con el autoencoder y el scaler "
-        "congelados del proyecto. Los candidatos μ + 3σ, P99, P99.5 y P99.9 "
-        "se calcularon **solo** con flujos benignos del lunes. El umbral "
-        "desplegado `τ = 0.000308` se mantuvo fijo; se muestra aparte del P99 "
-        "recalculado para verificar el redondeo y la reproducibilidad. "
-        "FPR y F1 se midieron en los archivos de martes a viernes, sin escoger "
-        "el umbral mirando esas etiquetas.",
+        "El autoencoder y el scaler congelados de SentinelAI reconstruyeron los flujos "
+        "de CIC-IDS2017. Los percentiles y la regla μ + 3σ se calcularon exclusivamente "
+        "con el MSE de los flujos benignos del lunes. El P99 desplegado conserva su "
+        f"valor histórico de `{DEPLOYED_THRESHOLD}`. Los siete archivos de martes a viernes "
+        "quedaron fuera de la calibración y aportan las etiquetas para medir detección y falsas alarmas.",
         "",
-        f"- Calibración: `{monday.name}`; {calibration_counts.benign_rows:,} "
-        f"benignos válidos, {calibration_counts.attack_rows:,} ataques excluidos, "
+        f"- El lunes (`{monday.name}`) aportó {calibration_counts.benign_rows:,} benignos válidos. "
+        f"Se excluyeron {calibration_counts.attack_rows:,} ataques y "
         f"{calibration_counts.invalid_rows:,} filas inválidas.",
-        f"- Evaluación: {len(holdouts)} archivos de martes a viernes; "
-        f"{evaluation_counts.benign_rows:,} benignos y "
-        f"{evaluation_counts.attack_rows:,} ataques válidos; "
-        f"{evaluation_counts.invalid_rows:,} filas inválidas.",
-        f"- Fracciones de muestreo: calibración {calibration_fraction:g}, "
-        f"evaluación {evaluation_fraction:g}; semilla {seed}. "
-        "Una fracción menor que 1 produce resultados exploratorios.",
-        f"- Modelo SHA-256: `{_sha256(model_path)}`; scaler SHA-256: "
-        f"`{_sha256(scaler_path)}`.",
-        "- Archivos de evaluación: " + ", ".join(f"`{p.name}`" for p in holdouts) + ".",
+        f"- La evaluación reunió {evaluation_counts.benign_rows:,} benignos y "
+        f"{evaluation_counts.attack_rows:,} ataques válidos. El número de filas inválidas "
+        f"descartadas fue {evaluation_counts.invalid_rows:,}. La prevalencia observada de ataques "
+        f"fue del {_fmt_pct(prevalence)} %.",
+        f"- Las fracciones de muestreo fueron {args.calibration_sample_fraction:g} en calibración "
+        f"y {args.evaluation_sample_fraction:g} en evaluación, con semilla {args.seed}.",
         "",
-        "## Forma de la distribución benigna",
+        "## Distribución del MSE benigno del lunes",
         "",
-        "Se aplicó D'Agostino-Pearson K² sobre los MSE benignos del lunes "
-        "(H₀: distribución normal; α = 0.05). La desviación estándar usa "
-        "ddof = 0 y los percentiles usan interpolación lineal de NumPy.",
+        "La prueba K² de D’Agostino-Pearson contrasta la hipótesis de normalidad con α = 0.05. "
+        "Se usó la desviación estándar poblacional (ddof = 0) y la interpolación lineal "
+        "de NumPy para los percentiles.",
         "",
         "| n | Media MSE | σ | Asimetría | Curtosis excedente | K² | p | Decisión |",
         "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | :--- |",
         f"| {int(calibration['n']):,} | {calibration['mean']:.9g} | "
         f"{calibration['std_population']:.9g} | {calibration['skewness']:.4f} | "
-        f"{calibration['excess_kurtosis']:.4f} | "
-        f"{calibration['normaltest_k2']:.4f} | "
+        f"{calibration['excess_kurtosis']:.4f} | {calibration['normaltest_k2']:.4f} | "
         f"{_fmt_p(calibration['normaltest_p'])} | "
         f"{'Se rechaza H₀' if reject else 'No se rechaza H₀'} |",
         "",
-        "La asimetría y la curtosis cuantifican la forma de la cola; el p-valor "
-        "por sí solo no mide el tamaño de la desviación, especialmente con "
-        "muestras grandes. La regla μ + 3σ supone una cola aproximadamente "
-        "normal si se interpreta como una garantía probabilística; P99 no "
-        "necesita esa hipótesis.",
+        "La asimetría y la curtosis describen cuánto se aparta la forma de la distribución "
+        "de la normal. Los percentiles estiman directamente la cola empírica. El significado "
+        "probabilístico de μ + 3σ depende de la distribución del MSE.",
         "",
-        "## Comparación en días no usados para calibrar",
+        "## Candidatos de alerta informativa",
         "",
-        "Se marca anomalía cuando `MSE > umbral`. FPR = FP/(TN+FP) sobre "
-        "benignos; F1 = 2TP/(2TP+FP+FN) para la clase ataque.",
+        "Se cuenta una alerta cuando `MSE > umbral`. La sensibilidad es la fracción de "
+        "ataques detectados, TP/(TP+FN). La precisión es la fracción de alertas que corresponden "
+        "a ataques, TP/(TP+FP). La FPR es el porcentaje de benignos marcados, 100 × FP/(TN+FP). "
+        "F1 = 2TP/(2TP+FP+FN). Los conteos suman los siete archivos antes de calcular las tasas.",
         "",
-        "| Método | Umbral MSE | TN | FP | FN | TP | FPR | F1 |",
-        "| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        *_score_table(candidates, alert_metrics),
+        "",
+        f"La diferencia absoluta entre el P99 recalculado y el desplegado es "
+        f"{abs(p99 - DEPLOYED_THRESHOLD):.3g} MSE.{rounding}",
+        "",
+        "## Candidatos de bloqueo crítico reversible",
+        "",
+        "Esta simulación cuenta un flujo como candidato al bloqueo cuando `MSE >= umbral crítico`. "
+        "El umbral crítico de una pareja debe superar al de alerta para que todo bloqueo potencial "
+        "sea también una alerta. Cada múltiplo 3 × P se calcula directamente sobre el percentil "
+        "benigno del lunes, sin aplicar el piso de severidad del backend.",
+        "",
+        *_score_table(critical, critical_metrics),
+        "",
+        "### Lectura de la pareja P90 / P99.9",
+        "",
     ]
-    for row in rows:
-        lines.append(
-            f"| {row['method']} | {row['threshold']:.9g} | {row['tn']:,} | "
-            f"{row['fp']:,} | {row['fn']:,} | {row['tp']:,} | "
-            f"{_fmt_metric(row['fpr'])} | {_fmt_metric(row['f1'])} |"
-        )
-    normal_row = next(row for row in rows if row["method"] == "μ + 3σ")
-    deployed_row = next(row for row in rows if row["method"] == "P99 desplegado")
-    recalculated_row = next(row for row in rows if row["method"] == "P99 recalculado")
-    lines += [
+    if candidates["P90"] < critical["P99.9"]:
+        lines.extend([
+            "Se ejemplifica la política con P90 para informar y P99.9 para bloquear. En la "
+            "calibración benigna corresponden a colas nominales del 10 % y del 0.1 %, respectivamente.",
+            "",
+            f"- Con P90 se detectan {alert['tp']:,} ataques (recall {_fmt_pct(alert['recall'])} %) "
+            f"y se marcan {alert['fp']:,} benignos (FPR {_fmt_pct(alert['fpr'])} %). "
+            f"Frente al P99 desplegado, con recall {_fmt_pct(reference['recall'])} %, el cambio "
+            f"es de {alert['tp'] - reference['tp']:+,} ataques detectados y "
+            f"{alert['fp'] - reference['fp']:+,} falsas alertas.",
+            f"- Superan o igualan P99.9 {block['tp']:,} ataques ({_fmt_pct(block['recall'])} % "
+            f"de todos los ataques) y {block['fp']:,} benignos (FPR crítica "
+            f"{_fmt_pct(block['fpr'])} %). De los falsos positivos de P90, la fracción "
+            f"que también alcanzaría el bloqueo es "
+            f"{_fmt_pct(block['fp'] / alert['fp'] if alert['fp'] else None)} %. "
+            f"Quedarían solo como informativos {alert['tp'] - block['tp']:,} ataques "
+            f"y {alert['fp'] - block['fp']:,} benignos.",
+        ])
+    else:
+        lines.append("P90 y P99.9 coinciden para esta calibración. La pareja requiere dos cortes distintos.")
+    lines.extend([
         "",
-        f"El P99 recalculado ({recalculated_row['threshold']:.9g}) "
-        f"difiere del τ desplegado ({DEPLOYED_THRESHOLD:.9g}) en "
-        f"{abs(recalculated_row['threshold'] - DEPLOYED_THRESHOLD):.3g} MSE, "
-        "compatible con el redondeo a seis decimales del notebook. "
-        f"En estos días, P99 desplegado obtuvo F1 = {_fmt_metric(deployed_row['f1'])} "
-        f"y FPR = {_fmt_metric(deployed_row['fpr'])}; μ + 3σ obtuvo "
-        f"F1 = {_fmt_metric(normal_row['f1'])} y FPR = "
-        f"{_fmt_metric(normal_row['fpr'])}. La elección implica un intercambio "
-        "entre detección y falsas alarmas; rechazar normalidad no demuestra "
-        "por sí solo que P99 sea óptimo. Tampoco debe interpretarse P99 como "
-        "una FPR de 1 % en los días de prueba.",
+        "La unidad de evaluación es el flujo. La política propuesta reserva el bloqueo para "
+        "el corte crítico. En el backend actual, con la respuesta activa habilitada y sin suspensión, "
+        "cualquier anomalía puede poner una IP en cuarentena. La severidad emplea el máximo "
+        "entre el piso crítico configurado y tres veces el umbral del sitio. Los conteos de "
+        "esta simulación miden flujos candidatos a la acción.",
         "",
-        "## Alcance de la conclusión",
+        "## Desglose por archivo y familia de ataque",
         "",
-        "El lunes ya se utilizó para ajustar el scaler y entrenar el autoencoder "
-        "original; por tanto, la calibración de estos candidatos es **dentro "
-        "de muestra** y su FPR del 1 % nominal no está garantizado en producción. "
-        "Los días restantes sí quedan fuera de la calibración de umbrales, "
-        "aunque la elección final entre métodos después de ver esta tabla "
-        "requeriría otra prueba independiente. Para afirmar una FPR calibrada "
-        "sin contaminación, hay que volver a entrenar separando previamente "
-        "entrenamiento y validación benigna, y reservar otros días para prueba.",
+        "Cada celda indica qué porcentaje de los flujos del grupo superó el umbral de alerta. "
+        "En BENIGN se lee la FPR del archivo. En cada etiqueta de ataque se lee la sensibilidad "
+        "para esa familia. La columna Flujos da el denominador de cada porcentaje. "
+        "P99 es el percentil recalculado del lunes.",
         "",
-        "La tabla compara umbrales; no modifica la configuración del backend. "
-        "Los CSV y el `.h5` son artefactos locales ignorados por Git; sus "
-        "hashes y el comando siguiente permiten identificar la ejecución.",
+        "| Archivo | Grupo | Flujos | " + " | ".join(f"{name} (%)" for name in DETAIL_METHODS) + " |",
+        "| :--- | :--- | ---: | " + " | ".join("---:" for _ in DETAIL_METHODS) + " |",
+    ])
+    for path, groups in breakdown.items():
+        for label in sorted(groups, key=lambda value: (value != "BENIGN", value)):
+            counts = groups[label]
+            rates = " | ".join(_fmt_pct(counts.alerts[name] / counts.flows) for name in DETAIL_METHODS)
+            display_label = label.replace("�", "–").replace("|", r"\|")
+            lines.append(f"| `{path.name}` | {display_label} | {counts.flows:,} | {rates} |")
+    lines.extend([
+        "",
+        "## Precisión esperada bajo distintas prevalencias",
+        "",
+        "Para una prevalencia π se estima el valor predictivo positivo con "
+        "`recall × π / (recall × π + FPR × (1 − π))`. Aquí la FPR se expresa como fracción. "
+        "La proyección conserva la sensibilidad y la FPR observadas en los siete archivos "
+        "y solo cambia la proporción de ataques. Un cambio en la mezcla de familias o en el "
+        "tráfico benigno también puede modificar esas tasas.",
+        "",
+        "| Acción | Método | 24,2 % | 10 % | 1 % | 0,1 % |",
+        "| :--- | :--- | ---: | ---: | ---: | ---: |",
+    ])
+    for action, metrics in (("Alerta", alert_metrics), ("Bloqueo", critical_metrics)):
+        for name, row in metrics.items():
+            rates = " | ".join(
+                _fmt_pct(expected_precision(row["recall"], row["fpr"], p)) for p in PREVALENCES
+            )
+            lines.append(f"| {action} | {name} | {rates} |")
+    lines.extend([
+        "",
+        "El 24,2 % aproxima la prevalencia del conjunto completo. Cada celda expresa la "
+        "precisión en porcentaje. N/D indica un denominador cero.",
+        "",
+        "## Alcance y reproducción",
+        "",
+        "El lunes se usó tanto para entrenar el autoencoder y ajustar el scaler como para "
+        "calibrar los umbrales. La FPR de bloqueo cuantifica falsos positivos en estos días. "
+        "Generalizarla a producción requiere una evaluación independiente con tráfico y "
+        "prevalencias representativos. Una selección de umbrales basada en el desempeño "
+        "observado de martes a viernes requiere un nuevo conjunto de prueba.",
+        "",
+        f"- SHA-256 del modelo: `{_sha256(args.model)}`.",
+        f"- SHA-256 del scaler: `{_sha256(args.scaler)}`.",
         "",
         "| CSV | SHA-256 |",
         "| :--- | :--- |",
-    ]
-    for path in [monday, *holdouts]:
+    ])
+    for path in (monday, *breakdown):
         lines.append(f"| `{path.name}` | `{_sha256(path)}` |")
-    lines += [
+    common_args = [
+        f"  --cic-dir {_cli_path(args.cic_dir)} \\",
+        f"  --model {_cli_path(args.model)} --scaler {_cli_path(args.scaler)} \\",
+        f"  --chunksize {args.chunksize} --batch-size {args.batch_size} --seed {args.seed} \\",
+    ]
+    lines.extend([
+        "",
+        "Desde la raíz del repositorio, el siguiente comando reproduce el análisis.",
         "",
         "```bash",
         "python SentinelAI-Model/threshold_analysis.py \\",
-        "  --cic-dir SentinelAI-Model/data \\",
-        "  --output docs/threshold_justification.md",
+        *common_args,
+        f"  --calibration-sample-fraction {args.calibration_sample_fraction:g} "
+        f"--evaluation-sample-fraction {args.evaluation_sample_fraction:g} \\",
+        f"  --output {_cli_path(args.output)}",
         "```",
-        "",
-    ]
-    return "\n".join(lines)
+    ])
+    if candidates["P90"] < critical["P99.9"]:
+        lines.extend([
+            "",
+            "El siguiente comando genera las matrices de alerta P90 y el resumen de bloqueo "
+            "P99.9 con los valores completos de ambos umbrales.",
+            "",
+            "```bash",
+            "python SentinelAI-Model/evaluate_ood.py \\",
+            *common_args,
+            f"  --sample-fraction {args.evaluation_sample_fraction:g} \\",
+            f"  --threshold {candidates['P90']!r} --critical-threshold {critical['P99.9']!r} \\",
+            "  --output-dir SentinelAI-Model/reports/ood-p90-p999 \\",
+            "  --plot-path docs/confusion_matrices.png",
+            "```",
+        ])
+        if args.evaluation_sample_fraction < 1:
+            lines.extend([
+                "",
+                "Con muestreo parcial, ambos scripts generan muestras exploratorias distintas "
+                "porque derivan la semilla de cada archivo de formas diferentes. La comparación "
+                "exacta de las matrices entre scripts usa la fracción de evaluación 1.",
+            ])
+    return "\n".join(lines) + "\n"
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -306,18 +455,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     files = sorted(args.cic_dir.glob("*.csv"))
-    monday_files = [path for path in files if path.name.lower().startswith("monday-")]
-    holdouts = [path for path in files if path not in monday_files]
-    if len(monday_files) != 1 or not holdouts:
-        raise ValueError("Expected one Monday CSV and at least one Tuesday--Friday CSV")
-    if any(not path.name.lower().startswith(("tuesday-", "wednesday-", "thursday-", "friday-")) for path in holdouts):
-        raise ValueError("Only Tuesday--Friday CIC-IDS2017 files may be used for evaluation")
+    days = ("monday", "tuesday", "wednesday", "thursday", "friday")
+    by_day = {
+        day: [p for p in files if p.name.lower().startswith(f"{day}-")] for day in days
+    }
+    if len(files) != 8 or [len(by_day[d]) for d in days] != [1, 1, 1, 2, 3]:
+        raise ValueError(
+            "Expected the eight CIC-IDS2017 CSVs: one Monday, one Tuesday, "
+            "one Wednesday, two Thursday and three Friday files"
+        )
+    monday = by_day["monday"][0]
+    holdouts = [path for day in days[1:] for path in by_day[day]]
     model, scaler, features = load_assets(args.model, args.scaler)
 
     calibration_counts = FileCounts()
     benign_batches: list[np.ndarray] = []
-    for mse, y in iter_reconstruction_errors(
-        monday_files[0], model=model, scaler=scaler, features=features,
+    for mse, y, _ in iter_reconstruction_errors(
+        monday, model=model, scaler=scaler, features=features,
         chunksize=args.chunksize, batch_size=args.batch_size,
         sample_fraction=args.calibration_sample_fraction, seed=args.seed,
         counts=calibration_counts,
@@ -327,38 +481,46 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("No valid benign Monday MSE values")
     benign = np.concatenate(benign_batches)
     calibration = describe_calibration(benign)
-    thresholds = candidate_thresholds(benign)
+    candidates = dict(candidate_thresholds(benign))
+    critical = critical_thresholds(candidates)
+    detail = {name: candidates[name] for name in DETAIL_METHODS}
 
     evaluation_counts = FileCounts()
-    totals = np.zeros((len(thresholds), 4), dtype=np.int64)
+    alert_totals = {name: np.zeros(4, dtype=np.int64) for name in candidates}
+    critical_totals = {name: np.zeros(4, dtype=np.int64) for name in critical}
+    breakdown: dict[Path, dict[str, GroupCounts]] = {}
     for path in holdouts:
         file_counts = FileCounts()
-        for mse, y in iter_reconstruction_errors(
+        groups: dict[str, GroupCounts] = {}
+        for mse, y, labels in iter_reconstruction_errors(
             path, model=model, scaler=scaler, features=features,
             chunksize=args.chunksize, batch_size=args.batch_size,
             sample_fraction=args.evaluation_sample_fraction, seed=args.seed,
             counts=file_counts,
         ):
-            for index, (_, threshold) in enumerate(thresholds):
-                totals[index] += confusion_counts(mse, y, threshold)
+            for name, threshold in candidates.items():
+                alert_totals[name] += confusion_counts(mse, y, threshold)
+            for name, threshold in critical.items():
+                critical_totals[name] += confusion_counts(mse, y, threshold, inclusive=True)
+            for label in np.unique(labels):
+                groups.setdefault(label, GroupCounts()).add(mse[labels == label], detail)
+        if not groups:
+            raise ValueError(f"No valid evaluated rows in {path}; check sampling and CSV quality")
+        breakdown[path] = groups
         evaluation_counts.add(file_counts)
         print(f"{path.name}: {file_counts.evaluated_rows:,} valid flows")
     if evaluation_counts.benign_rows == 0 or evaluation_counts.attack_rows == 0:
         raise ValueError("Evaluation needs both benign and attack flows to compare FPR and F1")
 
-    rows = [
-        {"method": name, "threshold": threshold,
-         **classification_metrics(tuple(int(x) for x in totals[index]))}
-        for index, (name, threshold) in enumerate(thresholds)
-    ]
+    def metrics(totals: dict[str, np.ndarray]) -> dict[str, dict[str, Any]]:
+        return {name: classification_metrics(tuple(map(int, counts))) for name, counts in totals.items()}
+
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(render_report(
-        calibration=calibration, rows=rows, monday=monday_files[0],
-        holdouts=holdouts, calibration_counts=calibration_counts,
-        evaluation_counts=evaluation_counts, model_path=args.model,
-        scaler_path=args.scaler,
-        calibration_fraction=args.calibration_sample_fraction,
-        evaluation_fraction=args.evaluation_sample_fraction, seed=args.seed,
+        calibration=calibration, candidates=candidates, critical=critical,
+        alert_metrics=metrics(alert_totals), critical_metrics=metrics(critical_totals),
+        monday=monday, breakdown=breakdown, calibration_counts=calibration_counts,
+        evaluation_counts=evaluation_counts, args=args,
     ), encoding="utf-8")
     print(f"Wrote {args.output}")
     return 0

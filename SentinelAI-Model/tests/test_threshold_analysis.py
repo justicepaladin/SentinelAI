@@ -38,8 +38,24 @@ class ThresholdAnalysisTests(unittest.TestCase):
         self.assertGreater(summary["excess_kurtosis"], 0)
         self.assertLess(summary["normaltest_p"], 0.05)
         self.assertEqual(candidates["P99 desplegado"], 0.000308)
-        self.assertLess(candidates["P99 recalculado"], candidates["P99.5"])
-        self.assertLess(candidates["P99.5"], candidates["P99.9"])
+        levels = [80, 85, 90, 95, 97, 98, 99, 99.5, 99.9]
+        values = [candidates["P99 recalculado" if p == 99 else f"P{p}"] for p in levels]
+        self.assertEqual(values, sorted(values))
+        np.testing.assert_allclose(values, np.percentile(errors, levels), rtol=1e-12)
+
+    def test_critical_candidates_reuse_monday_thresholds(self) -> None:
+        candidates = dict(analysis.candidate_thresholds(np.arange(1.0, 101.0)))
+        critical = analysis.critical_thresholds(candidates)
+        for name in ("P99.5", "P99.9", "μ + 3σ"):
+            self.assertEqual(critical[name], candidates[name])
+        for name in ("P90", "P95", "P97"):
+            self.assertEqual(critical[f"3 × {name}"], 3 * candidates[name])
+
+    def test_expected_precision_reweights_attacks_and_benign_flows(self) -> None:
+        # Out of 10,000 flows at 1% prevalence: 80 TP and 99 FP.
+        self.assertAlmostEqual(analysis.expected_precision(0.8, 0.01, 0.01), 80 / 179)
+        self.assertEqual(analysis.expected_precision(0.8, 0.0, 0.001), 1.0)
+        self.assertIsNone(analysis.expected_precision(0.0, 0.0, 0.1))
 
     def test_strict_boundary_and_confusion_metrics(self) -> None:
         mse = np.array([0.1, 0.2, 0.3, 0.4, 0.5])
@@ -48,25 +64,38 @@ class ThresholdAnalysisTests(unittest.TestCase):
         self.assertEqual(counts, (2, 1, 0, 2))
         metrics = analysis.classification_metrics(counts)
         self.assertAlmostEqual(metrics["fpr"], 1 / 3)
+        self.assertAlmostEqual(metrics["precision"], 2 / 3)
+        self.assertEqual(metrics["recall"], 1.0)
         self.assertAlmostEqual(metrics["f1"], 4 / 5)
         self.assertIsNone(analysis.classification_metrics((2, 0, 0, 0))["f1"])
+        self.assertEqual(analysis.confusion_counts(mse, labels, 0.2, inclusive=True),
+                         (1, 2, 0, 2))
 
     def test_report_calibrates_only_on_monday_and_counts_invalid_rows(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             cic_dir = root / "cic"
             cic_dir.mkdir()
-            monday = cic_dir / "Monday-WorkingHours.csv"
-            tuesday = cic_dir / "Tuesday-WorkingHours.csv"
+            monday = cic_dir / "Monday-WorkingHours.pcap_ISCX.csv"
+            tuesday = cic_dir / "Tuesday-WorkingHours.pcap_ISCX.csv"
             # MSE values are A² under the identity scaler and zero model.
             pd.DataFrame({
-                "A": np.linspace(0.01, 0.20, 20),
-                "Label": ["BENIGN"] * 20,
+                "A": [*range(1, 21), 999],
+                "Label": ["BENIGN"] * 20 + ["Excluded attack"],
             }).to_csv(monday, index=False)
             pd.DataFrame({
-                "A": [0.01, 0.1, 0.5, 0.7, float("inf")],
-                "Label": ["BENIGN", "BENIGN", "DoS", "DoS", "BENIGN"],
+                "A": [0, 19.25, 19, 19.5, 18, float("inf")],
+                "Label": ["BENIGN", "BENIGN", "FTP-Patator", "SSH-Patator", "SSH-Patator", "BENIGN"],
             }).to_csv(tuesday, index=False)
+            for name in (
+                "Wednesday-workingHours", "Thursday-WorkingHours-Morning-WebAttacks",
+                "Thursday-WorkingHours-Afternoon-Infilteration", "Friday-WorkingHours-Morning",
+                "Friday-WorkingHours-Afternoon-PortScan", "Friday-WorkingHours-Afternoon-DDos",
+            ):
+                flows = {"A": [0], "Label": ["BENIGN"]}
+                if name.endswith("PortScan"):
+                    flows = {"A": [0, 31.75, 32], "Label": ["BENIGN", "BENIGN", "PortScan"]}
+                pd.DataFrame(flows).to_csv(cic_dir / f"{name}.pcap_ISCX.csv", index=False)
             model_file = root / "model.h5"
             scaler_file = root / "scaler.save"
             model_file.write_bytes(b"fake model")
@@ -83,12 +112,33 @@ class ThresholdAnalysisTests(unittest.TestCase):
             self.assertEqual(rc, 0)
             content = report.read_text(encoding="utf-8")
             self.assertIn("20 benignos válidos", content)
-            self.assertIn("2 benignos y 2 ataques válidos; 1 filas inválidas", content)
+            self.assertIn("9 benignos", content)
+            self.assertIn("4 ataques válidos", content)
+            self.assertIn("filas inválidas descartadas fue 1", content)
             self.assertIn("P99 desplegado", content)
             self.assertIn("P99 recalculado", content)
-            self.assertIn("fuera de la calibración", content)
-            expected = np.percentile(np.square(np.linspace(0.01, 0.20, 20)), 99)
-            self.assertIn(f"{expected:.9g}", content)
+            # Holdout labels and the Monday attack must never affect calibration.
+            rows = [
+                [cell.strip().strip("`") for cell in line.strip("|").split("|")]
+                for line in content.splitlines() if line.startswith("|")
+            ]
+            expected_p90 = np.percentile(np.arange(1, 21) ** 2, 90)
+            p90 = next(row for row in rows if row[0] == "P90" and len(row) == 10)
+            self.assertAlmostEqual(float(p90[1]), expected_p90)
+            self.assertEqual(p90[2:6], ["7", "2", "1", "3"])
+            self.assertAlmostEqual(float(p90[8]), 22.22)
+            critical = next(row for row in rows if row[0] == "3 × P90" and len(row) == 10)
+            self.assertEqual(critical[2:6], ["8", "1", "3", "1"])
+            family = next(row for row in rows if "SSH-Patator" in row)
+            self.assertEqual(family[0], tuesday.name)
+            self.assertEqual([float(value) for value in family[2:]], [2, 50, 50, 50, 0])
+            projection = next(row for row in rows if row[:2] == ["Alerta", "P90"])
+            observed = [float(value) for value in projection[2:]]
+            expected = [
+                100 * (3 / 4 * p) / (3 / 4 * p + 2 / 9 * (1 - p))
+                for p in (0.242, 0.1, 0.01, 0.001)
+            ]
+            np.testing.assert_allclose(observed, expected, atol=0.005)
 
 
 if __name__ == "__main__":

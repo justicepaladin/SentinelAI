@@ -42,15 +42,19 @@ class Result:
     fp: int = 0
     fn: int = 0
     tp: int = 0
+    critical_fp: int = 0
+    critical_tp: int = 0
 
     def add(self, other: Result) -> None:
         for field in (
             "source_rows", "sampled_rows", "invalid_rows", "evaluated_rows",
-            "mse_sum", "tn", "fp", "fn", "tp",
+            "mse_sum", "tn", "fp", "fn", "tp", "critical_fp", "critical_tp",
         ):
             setattr(self, field, getattr(self, field) + getattr(other, field))
 
-    def as_metrics(self, threshold: float) -> dict[str, Any]:
+    def as_metrics(
+        self, threshold: float, critical_threshold: float | None = None,
+    ) -> dict[str, Any]:
         # Four weighted observations are enough to recover binary metrics without
         # retaining millions of flow-level predictions in memory.
         _, recall, f1, _ = precision_recall_fscore_support(
@@ -59,9 +63,9 @@ class Result:
             average="binary", zero_division=0,
         )
         precision = self.tp / (self.tp + self.fp) if self.tp + self.fp else 0.0
-        has_attacks = self.fn + self.tp > 0
-        has_benign = self.tn + self.fp > 0
-        return {
+        attack_rows = self.fn + self.tp
+        benign_rows = self.tn + self.fp
+        metrics = {
             "dataset": self.dataset,
             "group": self.group,
             "source": self.source,
@@ -70,17 +74,26 @@ class Result:
             "sampled_rows": self.sampled_rows,
             "invalid_rows": self.invalid_rows,
             "evaluated_rows": self.evaluated_rows,
-            "benign_rows": self.tn + self.fp,
-            "attack_rows": self.fn + self.tp,
+            "benign_rows": benign_rows,
+            "attack_rows": attack_rows,
             "tn": self.tn, "fp": self.fp, "fn": self.fn, "tp": self.tp,
             "accuracy": (self.tn + self.tp) / self.evaluated_rows,
             "precision": precision,
-            "recall": float(recall) if has_attacks else None,
-            "f1": float(f1) if has_attacks else None,
-            "false_positive_rate": self.fp / (self.tn + self.fp)
-            if has_benign else None,
+            "recall": float(recall) if attack_rows else None,
+            "f1": float(f1) if attack_rows else None,
+            "false_positive_rate": self.fp / benign_rows if benign_rows else None,
             "mean_mse": self.mse_sum / self.evaluated_rows,
         }
+        if critical_threshold is not None:
+            metrics.update({
+                "critical_threshold_mse": critical_threshold,
+                "critical_tp": self.critical_tp,
+                "critical_fp": self.critical_fp,
+                "critical_recall": self.critical_tp / attack_rows if attack_rows else None,
+                "critical_false_positive_rate": self.critical_fp / benign_rows if benign_rows else None,
+                "alert_fp_escalation_rate": self.critical_fp / self.fp if self.fp else None,
+            })
+        return metrics
 
 
 def load_assets(model_path: Path, scaler_path: Path) -> tuple[Any, Any, list[str]]:
@@ -181,6 +194,7 @@ def evaluate_file(
     scaler: Any,
     expected: list[str],
     threshold: float,
+    critical_threshold: float | None = None,
     chunksize: int,
     batch_size: int,
     sample_fraction: float,
@@ -235,7 +249,8 @@ def evaluate_file(
             )
             if reconstruction.shape != scaled.shape or not np.isfinite(reconstruction).all():
                 raise ValueError(f"Model output is invalid for {path}")
-            mse = np.mean(np.square(scaled - reconstruction), axis=1)
+            # Compare the model's float32 MSE to full-precision Monday percentiles.
+            mse = np.mean(np.square(scaled - reconstruction), axis=1).astype(np.float64)
             if not np.isfinite(mse).all():
                 raise ValueError(f"Non-finite MSE for {path}")
             actual = y[valid]
@@ -247,6 +262,13 @@ def evaluate_file(
             result.fp += int(fp)
             result.fn += int(fn)
             result.tp += int(tp)
+            if critical_threshold is not None:
+                # The backend alerts strictly above the alert threshold and
+                # treats equality with the higher critical threshold as critical.
+                blocked_labels = actual[mse >= critical_threshold]
+                critical_tp = int(np.count_nonzero(blocked_labels))
+                result.critical_tp += critical_tp
+                result.critical_fp += len(blocked_labels) - critical_tp
             result.evaluated_rows += len(actual)
             result.mse_sum += float(mse.sum(dtype=np.float64))
 
@@ -264,14 +286,24 @@ def aggregate(results: list[Result], dataset: str, group: str) -> Result:
     return merged
 
 
+def print_blocking_summary(result: Result, critical_threshold: float) -> None:
+    print(f"{result.dataset} | simulated blocks at MSE >= {critical_threshold:.12g}")
+    for description, count, total in (
+        ("Attacks blocked / all attacks", result.critical_tp, result.tp + result.fn),
+        ("Benign flows blocked / all benign flows (FPR)", result.critical_fp, result.fp + result.tn),
+        ("False alerts escalated to a block / all false alerts", result.critical_fp, result.fp),
+    ):
+        rate = f"{count / total:.4%}" if total else "undefined"
+        print(f"  {description}: {count:,}/{total:,} ({rate})")
+
+
 def save_results(
     results: list[Result], output_dir: Path, *, threshold: float,
     args: argparse.Namespace, features: list[str],
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame([result.as_metrics(threshold) for result in results]).to_csv(
-        output_dir / "metrics.csv", index=False
-    )
+    metrics = [result.as_metrics(threshold, args.critical_threshold) for result in results]
+    pd.DataFrame(metrics).to_csv(output_dir / "metrics.csv", index=False)
     matrix_rows = []
     for result in results:
         for actual, predicted, count in (
@@ -294,6 +326,8 @@ def save_results(
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
     except ImportError:
+        if args.plot_path is not None:
+            raise RuntimeError("Generating the requested --plot-path requires matplotlib")
         print("matplotlib is unavailable; CSV matrices saved, PNG skipped")
     else:
         columns = min(3, len(results))
@@ -314,7 +348,9 @@ def save_results(
             ax.axis("off")
         fig.suptitle(f"Frozen SentinelAI autoencoder | MSE > {threshold:.6g}")
         fig.tight_layout()
-        fig.savefig(output_dir / "confusion_matrices.png", dpi=160)
+        plot_path = args.plot_path or output_dir / "confusion_matrices.png"
+        plot_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(plot_path, dpi=160)
         plt.close(fig)
         plot_written = True
 
@@ -325,6 +361,8 @@ def save_results(
         "threshold_provenance": (
             "Pre-existing deployed threshold; original notebook derived it from "
             "Monday training reconstruction errors. Never tuned on evaluated days."
+            if threshold == DEPLOYED_THRESHOLD
+            else "Alert threshold supplied via --threshold."
         ),
         "feature_count": len(features),
         "feature_names": features,
@@ -340,10 +378,15 @@ def save_results(
             "Raw tabular UNSW-NB15 columns are not interchangeable with the "
             "78 CIC-IDS2017 flow features. External evaluation requires "
             "equivalent feature extraction and verified labels.",
-            "The frozen threshold came from training errors; a future retraining "
+            "The deployed threshold came from training errors; a future retraining "
             "run should reserve disjoint benign calibration data.",
         ],
     }
+    if args.critical_threshold is not None:
+        metadata["critical_threshold_mse"] = args.critical_threshold
+    if args.plot_path is not None:
+        metadata["comparison_png_path"] = str(args.plot_path.resolve())
+        print(f"Wrote alert confusion matrices PNG to {args.plot_path.resolve()}")
     (output_dir / "evaluation.json").write_text(
         json.dumps(metadata, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
     )
@@ -377,8 +420,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", type=Path, default=HERE / "models/sentinel_model.h5")
     parser.add_argument("--scaler", type=Path, default=HERE / "models/sentinel_scaler.save")
     parser.add_argument("--threshold", type=float, default=DEPLOYED_THRESHOLD,
-                        help="Frozen MSE threshold (default: deployed 0.000308)")
+                        help="Alert when MSE exceeds this threshold (default: deployed 0.000308)")
+    parser.add_argument("--critical-threshold", type=float,
+                        help="Report simulated blocks at or above this MSE (must be > --threshold)")
     parser.add_argument("--output-dir", type=Path, default=HERE / "reports/ood")
+    parser.add_argument("--plot-path", type=Path,
+                        help="Destination of the alert confusion matrices PNG (default: in --output-dir)")
     parser.add_argument("--chunksize", type=positive_int, default=8192)
     parser.add_argument("--batch-size", type=positive_int, default=1024)
     parser.add_argument("--sample-fraction", type=fraction, default=1.0,
@@ -393,6 +440,10 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if not math.isfinite(args.threshold) or args.threshold < 0:
         raise ValueError("--threshold must be a finite non-negative MSE")
+    if args.critical_threshold is not None and (
+        not math.isfinite(args.critical_threshold) or args.critical_threshold <= args.threshold
+    ):
+        raise ValueError("--critical-threshold must be finite and > --threshold")
     if args.external_feature_map and not args.external_csv:
         raise ValueError("--external-feature-map requires --external-csv")
     days = sorted(args.cic_dir.glob(args.cic_pattern))
@@ -424,11 +475,12 @@ def main(argv: list[str] | None = None) -> int:
         group = "cic_training_reference" if monday else "cic_holdout"
         result = evaluate_file(
             path, model=model, scaler=scaler, expected=features,
-            threshold=args.threshold, chunksize=args.chunksize,
+            threshold=args.threshold, critical_threshold=args.critical_threshold,
+            chunksize=args.chunksize,
             batch_size=args.batch_size, sample_fraction=args.sample_fraction,
             seed=args.seed, external=False, group=group,
         )
-        print(f"{result.dataset}: {result.as_metrics(args.threshold)}")
+        print(f"{result.dataset}: {result.as_metrics(args.threshold, args.critical_threshold)}")
         (training_reference if monday else holdout).append(result)
     if not holdout:
         raise ValueError("No held-out CIC day found; Monday alone cannot validate this model")
@@ -437,19 +489,24 @@ def main(argv: list[str] | None = None) -> int:
     for path in args.external_csv:
         result = evaluate_file(
             path, model=model, scaler=scaler, expected=features,
-            threshold=args.threshold, chunksize=args.chunksize,
+            threshold=args.threshold, critical_threshold=args.critical_threshold,
+            chunksize=args.chunksize,
             batch_size=args.batch_size, sample_fraction=args.sample_fraction,
             seed=args.seed, external=True, feature_map=feature_map,
             external_label=args.external_label,
         )
-        print(f"{result.dataset}: {result.as_metrics(args.threshold)}")
+        print(f"{result.dataset}: {result.as_metrics(args.threshold, args.critical_threshold)}")
         external_results.append(result)
 
-    results = [aggregate(holdout, "CIC held-out aggregate", "cic_holdout")]
-    results += holdout + training_reference
+    holdout_total = aggregate(holdout, "CIC held-out aggregate", "cic_holdout")
+    results = [holdout_total, *holdout, *training_reference]
+    if args.critical_threshold is not None:
+        print_blocking_summary(holdout_total, args.critical_threshold)
     if external_results:
-        results += [aggregate(external_results, "External aggregate", "external")]
-        results += external_results
+        external_total = aggregate(external_results, "External aggregate", "external")
+        results += [external_total, *external_results]
+        if args.critical_threshold is not None:
+            print_blocking_summary(external_total, args.critical_threshold)
     else:
         print("No external CSV supplied: OOD performance is not evaluated.")
     save_results(results, args.output_dir, threshold=args.threshold, args=args, features=features)
